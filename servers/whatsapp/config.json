@@ -1,0 +1,4 @@
+{
+  "command": "${BIN:uv}",
+  "args": ["--directory", "${REPO}/servers/whatsapp/src/whatsapp-mcp-server", "run", "main.py"]
+}

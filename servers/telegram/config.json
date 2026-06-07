@@ -1,0 +1,10 @@
+{
+  "command": "${BIN:uv}",
+  "args": ["--directory", "${REPO}/servers/telegram/src", "run", "main.py"],
+  "env": {
+    "TELEGRAM_SKIP_WARMUP": "1",
+    "TELEGRAM_API_ID": "${SECRET:TELEGRAM_API_ID}",
+    "TELEGRAM_API_HASH": "${SECRET:TELEGRAM_API_HASH}",
+    "TELEGRAM_SESSION_STRING_CLAUDEMCP": "${SECRET:TELEGRAM_SESSION_STRING_CLAUDEMCP}"
+  }
+}

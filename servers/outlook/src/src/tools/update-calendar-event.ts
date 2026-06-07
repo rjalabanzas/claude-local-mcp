@@ -1,0 +1,74 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { GraphService } from "../simply-outlook/graph-service.js";
+import { getErrorToolResult, textToolResult, toCalendarEventResult } from "./tool-utils.js";
+
+export const UPDATE_CALENDAR_EVENT_TOOL_NAME = "update-calendar-event";
+
+export const registerUpdateCalendarEventTool = async (server: McpServer, graphService: GraphService, toolNamePrefix: string) => {
+  server.tool(
+    `${toolNamePrefix}${UPDATE_CALENDAR_EVENT_TOOL_NAME}`,
+    "Update an existing calendar event in Outlook. You can modify the subject, content, start/end times, or location. At least one field must be provided to update.",
+    {
+      id: z
+        .string()
+        .describe(
+          "This is a base64-encoded string that uniquely identifies the calendar event to update. Preserve the exact ID format including any trailing '=' padding characters."
+        ),
+      subject: z.string().optional().describe("Optional new title/subject for the calendar event"),
+      startDateTime: z
+        .string()
+        .optional()
+        .describe(
+          "Optional new start date and time in ISO format using local time zone. Format: 'YYYY-MM-DDTHH:mm:ss' (e.g., '2025-12-25T14:30:00')"
+        ),
+      endDateTime: z
+        .string()
+        .optional()
+        .describe(
+          "Optional new end date and time in ISO format using local time zone. Format: 'YYYY-MM-DDTHH:mm:ss' (e.g., '2025-12-25T15:00:00')"
+        ),
+      location: z
+        .string()
+        .optional()
+        .describe(
+          "Optional new location or venue for the event (e.g., 'Conference Room A', 'Airport', 'Central Park'). Use empty string to remove location."
+        ),
+      content: z
+        .string()
+        .optional()
+        .describe("Optional new description or body content for the event. Must be in markdown or plain text format."),
+      categories: z
+        .string()
+        .array()
+        .optional()
+        .describe(
+          "Optional array of category display names to assign to the event (e.g., ['Important', 'Work']). This replaces existing categories. Use empty array [] to remove all categories. The categories must already exist as master categories."
+        ),
+    },
+    async ({ id, subject, content, startDateTime, endDateTime, location, categories }) => {
+      try {
+        const startDateTimeUtc = startDateTime ? new Date(startDateTime).toISOString() : undefined;
+        const endDateTimeUtc = endDateTime ? new Date(endDateTime).toISOString() : undefined;
+
+        const eventData = await graphService.updateCalendarEvent(
+          id,
+          content,
+          subject,
+          startDateTimeUtc,
+          endDateTimeUtc,
+          location,
+          categories
+        );
+
+        return textToolResult([
+          `Do not show the event ID to the user.`,
+          `Calendar event updated successfully:`,
+          JSON.stringify(toCalendarEventResult(eventData)),
+        ]);
+      } catch (error) {
+        return getErrorToolResult(error, "Failed to update calendar event.");
+      }
+    }
+  );
+};

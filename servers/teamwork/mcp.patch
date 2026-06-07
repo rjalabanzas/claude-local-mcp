@@ -1,0 +1,54 @@
+diff --git a/internal/twprojects/tasks.go b/internal/twprojects/tasks.go
+index b13830a..e3efdb8 100644
+--- a/internal/twprojects/tasks.go
++++ b/internal/twprojects/tasks.go
+@@ -615,7 +615,8 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+ 		Tool: &mcp.Tool{
+ 			Name: string(MethodTaskList),
+ 			Description: "List tasks with structured filters (tasklist_id, project_id, or site-wide). " +
+-				"For keyword search use search.",
++				"Filter by due date with due_after / due_before, or set overdue=true to return " +
++				"only overdue tasks. For keyword search use search.",
+ 			Annotations: &mcp.ToolAnnotations{
+ 				Title:        "List Tasks",
+ 				ReadOnlyHint: true,
+@@ -702,6 +703,29 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+ 							{Type: "null"},
+ 						},
+ 					},
++					"due_after": {
++						Description: "Filter tasks with a due date on or after this date.",
++						Examples:    []any{"2026-01-01T00:00:00Z"},
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string", Format: "date-time"},
++							{Type: "null"},
++						},
++					},
++					"due_before": {
++						Description: "Filter tasks with a due date on or before this date.",
++						Examples:    []any{"2026-12-31T00:00:00Z"},
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string", Format: "date-time"},
++							{Type: "null"},
++						},
++					},
++					"overdue": {
++						Description: "If true, return only overdue tasks (due date in the past and not completed).",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "boolean"},
++							{Type: "null"},
++						},
++					},
+ 					"page":      helpers.PageSchema(),
+ 					"page_size": helpers.PageSizeSchema(),
+ 					"verbose":   helpers.VerboseSchema(),
+@@ -734,6 +758,9 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+ 				helpers.OptionalTimePointerParam(&taskListRequest.Filters.UpdatedBefore, "updated_before"),
+ 				helpers.OptionalTimePointerParam(&taskListRequest.Filters.CompletedAfter, "completed_after"),
+ 				helpers.OptionalTimePointerParam(&taskListRequest.Filters.CompletedBefore, "completed_before"),
++				helpers.OptionalTimePointerParam(&taskListRequest.Filters.DueAfter, "due_after"),
++				helpers.OptionalTimePointerParam(&taskListRequest.Filters.DueBefore, "due_before"),
++				helpers.OptionalPointerParam(&taskListRequest.Filters.Overdue, "overdue"),
+ 				helpers.OptionalParam(&verbose, "verbose"),
+ 			)
+ 			if err != nil {

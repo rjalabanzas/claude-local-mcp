@@ -1,0 +1,7 @@
+{
+  "command": "${BIN:node}",
+  "args": ["${REPO}/servers/outlook/src/dist/index.js"],
+  "env": {
+    "SIMPLY_OUTLOOK_MCP_CLIENT_ID": "${ASK:SIMPLY_OUTLOOK_MCP_CLIENT_ID}"
+  }
+}

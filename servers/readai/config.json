@@ -1,0 +1,4 @@
+{
+  "command": "${BIN:uv}",
+  "args": ["run", "--quiet", "${REPO}/servers/readai/server.py"]
+}

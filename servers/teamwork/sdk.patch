@@ -1,0 +1,41 @@
+diff --git a/projects/task.go b/projects/task.go
+index 43b1520..ed1bf80 100644
+--- a/projects/task.go
++++ b/projects/task.go
+@@ -778,6 +778,20 @@ type TaskListRequestFilters struct {
+ 	// specific date and time.
+ 	CompletedBefore *time.Time
+ 
++	// DueAfter is an optional filter to retrieve tasks with a due date on or
++	// after a specific date. Only the date portion (YYYY-MM-DD) is sent to the
++	// API.
++	DueAfter *time.Time
++
++	// DueBefore is an optional filter to retrieve tasks with a due date on or
++	// before a specific date. Only the date portion (YYYY-MM-DD) is sent to the
++	// API.
++	DueBefore *time.Time
++
++	// Overdue is an optional flag that, when set to true, restricts the results
++	// to only overdue tasks (due date in the past and not completed).
++	Overdue *bool
++
+ 	// TagIDs is an optional list of tag IDs to filter tasks by tags.
+ 	TagIDs []int64
+ 
+@@ -838,6 +852,15 @@ func (t TaskListRequestFilters) apply(req *http.Request) {
+ 	if t.CompletedBefore != nil && !t.CompletedBefore.IsZero() {
+ 		query.Set("completedBefore", t.CompletedBefore.Format(time.RFC3339))
+ 	}
++	if t.DueAfter != nil && !t.DueAfter.IsZero() {
++		query.Set("dueAfter", t.DueAfter.Format("2006-01-02"))
++	}
++	if t.DueBefore != nil && !t.DueBefore.IsZero() {
++		query.Set("dueBefore", t.DueBefore.Format("2006-01-02"))
++	}
++	if t.Overdue != nil && *t.Overdue {
++		query.Set("taskFilter", "overdue")
++	}
+ 	if len(t.TagIDs) > 0 {
+ 		tagIDs := make([]string, len(t.TagIDs))
+ 		for i, id := range t.TagIDs {

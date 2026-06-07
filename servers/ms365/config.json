@@ -1,0 +1,8 @@
+{
+  "command": "${BIN:npx}",
+  "args": ["-y", "@softeria/ms-365-mcp-server@latest", "--org-mode"],
+  "env": {
+    "MS365_MCP_CLIENT_ID": "${ASK:MS365_MCP_CLIENT_ID}",
+    "MS365_MCP_TENANT_ID": "${ASK:MS365_MCP_TENANT_ID}"
+  }
+}
