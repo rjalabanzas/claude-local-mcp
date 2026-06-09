@@ -1,3 +1,314 @@
+diff --git a/internal/twprojects/notifications.go b/internal/twprojects/notifications.go
+new file mode 100644
+index 0000000..83b1834
+--- /dev/null
++++ b/internal/twprojects/notifications.go
+@@ -0,0 +1,305 @@
++package twprojects
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// List of methods available in the Teamwork.com MCP service.
++//
++// The naming convention for methods follows a pattern described here:
++// https://github.com/github/github-mcp-server/issues/333
++const (
++	MethodMyNotifications toolsets.Method = "twprojects-get_my_notifications"
++)
++
++// notificationsMaxFetch bounds how many notifications a single call pulls from
++// the feed. When unread_only or collapse_repeats is set the tool fetches up to
++// this many newest items so it has enough material to filter/group; the
++// result is then capped to max_results.
++const notificationsMaxFetch = 250
++
++var myNotificationsOutputSchema *jsonschema.Schema
++
++func init() {
++	var err error
++	myNotificationsOutputSchema, err = jsonschema.For[myNotificationsResult](&jsonschema.ForOptions{})
++	if err != nil {
++		panic(fmt.Sprintf("failed to generate JSON schema for myNotificationsResult: %v", err))
++	}
++}
++
++// myNotification is a single entry from the user's notification bell.
++type myNotification struct {
++	ID          int64  `json:"id"`
++	At          string `json:"at"`
++	Event       string `json:"event"`
++	Type        string `json:"type"`
++	Read        bool   `json:"read"`
++	Description string `json:"description"`
++	Detail      string `json:"detail,omitempty"`
++	Project     string `json:"project"`
++	Actor       string `json:"actor"`
++	Link        string `json:"link"`
++	// Count is 1 for an individual notification, or the size of the group when
++	// collapse_repeats merged several same-project/same-event notifications.
++	Count int `json:"count"`
++}
++
++// myNotificationsResult is the structured payload returned by the tool.
++type myNotificationsResult struct {
++	UnreadTotal   int              `json:"unreadTotal"`
++	Returned      int              `json:"returned"`
++	Truncated     bool             `json:"truncated"`
++	Notifications []myNotification `json:"notifications"`
++}
++
++// notificationsRequest is a local HTTP requester for the v3 notifications feed —
++// the same data that backs the in-app notification bell. There is no SDK type
++// for this endpoint, so the requester lives here (no twapi-go-sdk edit). The
++// feed is returned newest-first.
++type notificationsRequest struct {
++	PageSize int64
++}
++
++// HTTPRequest builds the GET request for the notifications feed.
++func (r notificationsRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server+"/projects/api/v3/notifications.json", nil)
++	if err != nil {
++		return nil, err
++	}
++	query := req.URL.Query()
++	if r.PageSize > 0 {
++		query.Set("pageSize", strconv.FormatInt(r.PageSize, 10))
++	}
++	req.URL.RawQuery = query.Encode()
++	return req, nil
++}
++
++// rawNotification is the subset of a notification record the tool reads.
++type rawNotification struct {
++	ID               int64     `json:"id"`
++	Event            string    `json:"event"`
++	Action           string    `json:"action"`
++	Date             time.Time `json:"date"`
++	Read             bool      `json:"read"`
++	Description      string    `json:"description"`
++	ExtraDescription string    `json:"extraDescription"`
++	Link             string    `json:"link"`
++	Item             struct {
++		ID   int64  `json:"id"`
++		Type string `json:"type"`
++	} `json:"item"`
++	Project struct {
++		ID   int64  `json:"id"`
++		Name string `json:"name"`
++	} `json:"project"`
++	User struct {
++		FirstName string `json:"firstname"`
++		LastName  string `json:"lastname"`
++	} `json:"user"`
++}
++
++// rawNotificationsResponse is the subset of the feed response the tool reads.
++type rawNotificationsResponse struct {
++	Notifications []rawNotification `json:"notifications"`
++	Meta          struct {
++		TotalUnreadNotifications int `json:"totalUnreadNotifications"`
++	} `json:"meta"`
++}
++
++// MyNotifications returns the user's notification bell — the items Teamwork
++// itself decided to notify them about — with optional unread filtering and an
++// optional collapse of repeated same-project/same-event notifications.
++func MyNotifications(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodMyNotifications),
++			Description: "Get your Teamwork notifications — the same items shown in the in-app " +
++				"notification bell (tasks assigned to or changed for you, comments, mentions, " +
++				"notebook and project updates you follow). Newest first. Optionally filter to " +
++				"unread only, or collapse repeated same-project/same-event notifications into counts.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "Get My Notifications",
++				ReadOnlyHint: true,
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"max_results": {
++						Type:        "integer",
++						Description: "Maximum number of notifications (or collapsed groups) to return. Defaults to 30.",
++					},
++					"unread_only": {
++						Type:        "boolean",
++						Description: "When true, return only unread notifications. Defaults to false.",
++					},
++					"collapse_repeats": {
++						Type: "boolean",
++						Description: "When true, collapse runs of same-project/same-event notifications " +
++							"(e.g. bulk procurement card tasks) into a single counted row. Defaults to " +
++							"false, which mirrors the bell exactly.",
++					},
++				},
++				Required: []string{},
++			},
++			OutputSchema: helpers.WithOptionalFields(myNotificationsOutputSchema),
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			maxResults := int64(30)
++			unreadOnly := false
++			collapseRepeats := false
++			err := helpers.ParamGroup(arguments,
++				helpers.OptionalNumericParam(&maxResults, "max_results"),
++				helpers.OptionalParam(&unreadOnly, "unread_only"),
++				helpers.OptionalParam(&collapseRepeats, "collapse_repeats"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			if maxResults <= 0 {
++				maxResults = 30
++			}
++
++			// When filtering or collapsing we pull a generous window so the
++			// post-processing has enough material; otherwise just the newest N.
++			pageSize := maxResults
++			if unreadOnly || collapseRepeats {
++				pageSize = notificationsMaxFetch
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, notificationsRequest{PageSize: pageSize})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to list notifications")
++			}
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode != http.StatusOK {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to list notifications"),
++					"failed to list notifications",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			var decoded rawNotificationsResponse
++			if err := json.Unmarshal(body, &decoded); err != nil {
++				return nil, fmt.Errorf("failed to decode notifications response: %w", err)
++			}
++
++			items := decoded.Notifications
++			truncated := false
++			if unreadOnly {
++				unread := items[:0]
++				for _, n := range items {
++					if !n.Read {
++						unread = append(unread, n)
++					}
++				}
++				items = unread
++				// We only fetched the newest window; if the account reports more
++				// unread than we captured, surface it rather than silently
++				// implying these are all of them.
++				if decoded.Meta.TotalUnreadNotifications > len(items) {
++					truncated = true
++				}
++			}
++
++			var notifications []myNotification
++			if collapseRepeats {
++				notifications = collapseNotifications(items)
++			} else {
++				notifications = make([]myNotification, 0, len(items))
++				for _, n := range items {
++					notifications = append(notifications, toMyNotification(n, 1))
++				}
++			}
++
++			if int64(len(notifications)) > maxResults {
++				notifications = notifications[:maxResults]
++			}
++
++			result := myNotificationsResult{
++				UnreadTotal:   decoded.Meta.TotalUnreadNotifications,
++				Returned:      len(notifications),
++				Truncated:     truncated,
++				Notifications: notifications,
++			}
++
++			encoded, err := json.Marshal(result)
++			if err != nil {
++				return nil, fmt.Errorf("failed to encode notifications result: %w", err)
++			}
++			return &mcp.CallToolResult{
++				Content: []mcp.Content{
++					&mcp.TextContent{Text: string(encoded)},
++				},
++				StructuredContent: result,
++			}, nil
++		},
++	}
++}
++
++// toMyNotification projects a raw record into the output shape.
++func toMyNotification(n rawNotification, count int) myNotification {
++	actor := strings.TrimSpace(n.User.FirstName + " " + n.User.LastName)
++	return myNotification{
++		ID:          n.ID,
++		At:          n.Date.Format(time.RFC3339),
++		Event:       n.Event,
++		Type:        n.Item.Type,
++		Read:        n.Read,
++		Description: n.Description,
++		Detail:      n.ExtraDescription,
++		Project:     n.Project.Name,
++		Actor:       actor,
++		Link:        n.Link,
++		Count:       count,
++	}
++}
++
++// collapseNotifications merges notifications that share a project and event into
++// a single counted row, keeping the newest one as the representative. Input is
++// expected newest-first; group order follows first (newest) appearance.
++func collapseNotifications(items []rawNotification) []myNotification {
++	type key struct {
++		projectID int64
++		event     string
++		typ       string
++	}
++	counts := map[key]int{}
++	rep := map[key]rawNotification{}
++	var order []key
++	for _, n := range items {
++		k := key{projectID: n.Project.ID, event: n.Event, typ: n.Item.Type}
++		if _, ok := counts[k]; !ok {
++			order = append(order, k)
++			rep[k] = n // first seen is newest
++		}
++		counts[k]++
++	}
++	out := make([]myNotification, 0, len(order))
++	for _, k := range order {
++		out = append(out, toMyNotification(rep[k], counts[k]))
++	}
++	return out
++}
 diff --git a/internal/twprojects/tasks.go b/internal/twprojects/tasks.go
 index b13830a..e3efdb8 100644
 --- a/internal/twprojects/tasks.go
@@ -52,3 +363,15 @@ index b13830a..e3efdb8 100644
  				helpers.OptionalParam(&verbose, "verbose"),
  			)
  			if err != nil {
+diff --git a/internal/twprojects/tools.go b/internal/twprojects/tools.go
+index 39dbce4..f8f930d 100644
+--- a/internal/twprojects/tools.go
++++ b/internal/twprojects/tools.go
+@@ -236,6 +236,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+ 		AddWriteTools(contentWriteTools...).
+ 		AddReadTools(
+ 			ActivityList(engine),
++			MyNotifications(engine),
+ 			CommentGet(engine),
+ 			CommentList(engine),
+ 			MilestoneGet(engine),
