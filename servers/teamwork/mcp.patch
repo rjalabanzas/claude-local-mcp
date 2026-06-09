@@ -1,3 +1,329 @@
+diff --git a/internal/twprojects/files.go b/internal/twprojects/files.go
+new file mode 100644
+index 0000000..e054d31
+--- /dev/null
++++ b/internal/twprojects/files.go
+@@ -0,0 +1,320 @@
++package twprojects
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
++	"mime/multipart"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// List of methods available in the Teamwork.com MCP service.
++const (
++	MethodFileUpload toolsets.Method = "twprojects-upload_file"
++)
++
++// pendingFileUploadRequest uploads a local file to Teamwork.com's pending
++// files area. It implements twapi.HTTPRequester so it can be executed by the
++// shared engine (which injects authentication). The returned pending file
++// reference is then attached to a task or project.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/file-uploads/post-pendingfiles-json
++type pendingFileUploadRequest struct {
++	Filename    string
++	ContentType string
++	Data        []byte
++}
++
++func (r pendingFileUploadRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	var body bytes.Buffer
++	writer := multipart.NewWriter(&body)
++
++	header := make(map[string][]string)
++	header["Content-Disposition"] = []string{
++		fmt.Sprintf(`form-data; name="file"; filename=%q`, r.Filename),
++	}
++	if r.ContentType != "" {
++		header["Content-Type"] = []string{r.ContentType}
++	}
++	part, err := writer.CreatePart(header)
++	if err != nil {
++		return nil, fmt.Errorf("failed to create multipart file part: %w", err)
++	}
++	if _, err := part.Write(r.Data); err != nil {
++		return nil, fmt.Errorf("failed to write file data: %w", err)
++	}
++	if err := writer.Close(); err != nil {
++		return nil, fmt.Errorf("failed to finalise multipart body: %w", err)
++	}
++
++	uri := fmt.Sprintf("%s/pendingfiles.json", server)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", writer.FormDataContentType())
++	return req, nil
++}
++
++// taskFileAttachRequest attaches one or more already-uploaded pending files to
++// an existing task via the v1 task update endpoint. Using
++// pendingFileAttachments adds the files without disturbing other task fields.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/tasks/put-tasks-id-json
++type taskFileAttachRequest struct {
++	TaskID         int64
++	PendingFileRef string
++}
++
++func (r taskFileAttachRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{
++		"todo-item": map[string]any{
++			"pendingFileAttachments": r.PendingFileRef,
++		},
++	}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode task attach request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/tasks/%d.json", server, r.TaskID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// projectFileAttachRequest stores an already-uploaded pending file in a
++// project's Files area via the v1 project files endpoint.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/post-projects-id-files-json
++type projectFileAttachRequest struct {
++	ProjectID      int64
++	PendingFileRef string
++}
++
++func (r projectFileAttachRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{
++		"file": map[string]any{
++			"pendingFileRef": r.PendingFileRef,
++		},
++	}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode project attach request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/projects/%d/files.json", server, r.ProjectID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// commentFileAttachRequest posts a new comment on a task with an
++// already-uploaded pending file attached to that comment. The file shows in
++// the task's comment thread (and, like any task file, in the project's Files
++// area).
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/comments/post-tasks-id-comments-json
++type commentFileAttachRequest struct {
++	TaskID         int64
++	Body           string
++	PendingFileRef string
++}
++
++func (r commentFileAttachRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{
++		"comment": map[string]any{
++			"body":                   r.Body,
++			"content-type":           "text",
++			"pendingFileAttachments": r.PendingFileRef,
++		},
++	}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode comment attach request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/tasks/%d/comments.json", server, r.TaskID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// FileUpload uploads a local file to Teamwork.com and attaches it to a task, a
++// project, or a new comment on a task. Exactly one of task_id or project_id
++// must be supplied; when comment is also provided, the file is attached to a
++// new comment on the task instead of directly to the task.
++func FileUpload(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodFileUpload),
++			Description: "Upload a local file and attach it to a task or a project's Files area. " +
++				"Provide the absolute file_path on disk plus exactly one of task_id or project_id.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Upload File",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"file_path": {
++						Type:        "string",
++						Description: "Absolute path to the local file to upload.",
++					},
++					"task_id": {
++						Description: "The ID of the task to attach the file to. Provide this OR project_id, not both.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "integer"},
++							{Type: "null"},
++						},
++					},
++					"project_id": {
++						Description: "The ID of the project to attach the file to (Files area). Provide this OR task_id, not both.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "integer"},
++							{Type: "null"},
++						},
++					},
++					"file_name": {
++						Description: "Optional override for the stored file name. Defaults to the file_path base name.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string"},
++							{Type: "null"},
++						},
++					},
++					"comment": {
++						Description: "Optional comment text. When provided (with task_id), the file is attached to a new " +
++							"comment on the task instead of directly to the task.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string"},
++							{Type: "null"},
++						},
++					},
++				},
++				Required: []string{"file_path"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var filePath, fileName, comment string
++			var taskID, projectID int64
++			err := helpers.ParamGroup(arguments,
++				helpers.RequiredParam(&filePath, "file_path"),
++				helpers.OptionalNumericParam(&taskID, "task_id"),
++				helpers.OptionalNumericParam(&projectID, "project_id"),
++				helpers.OptionalParam(&fileName, "file_name"),
++				helpers.OptionalParam(&comment, "comment"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			switch {
++			case taskID == 0 && projectID == 0:
++				return helpers.NewToolResultTextError("either task_id or project_id must be provided"), nil
++			case taskID != 0 && projectID != 0:
++				return helpers.NewToolResultTextError("provide only one of task_id or project_id, not both"), nil
++			case comment != "" && taskID == 0:
++				return helpers.NewToolResultTextError("comment can only be used together with task_id"), nil
++			}
++
++			data, err := os.ReadFile(filePath)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to read file %q: %s", filePath, err.Error()), nil
++			}
++			if fileName == "" {
++				fileName = filepath.Base(filePath)
++			}
++			contentType := mime.TypeByExtension(filepath.Ext(fileName))
++			if contentType == "" {
++				contentType = http.DetectContentType(data)
++			}
++
++			// Step 1: upload to the pending files area to obtain a reference.
++			uploadResp, err := twapi.ExecuteRaw(ctx, engine, pendingFileUploadRequest{
++				Filename:    fileName,
++				ContentType: contentType,
++				Data:        data,
++			})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to upload file")
++			}
++			defer func() { _ = uploadResp.Body.Close() }()
++			if uploadResp.StatusCode < 200 || uploadResp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(uploadResp, "failed to upload file"), "failed to upload file",
++				)
++			}
++			rawUpload, err := io.ReadAll(uploadResp.Body)
++			if err != nil {
++				return nil, fmt.Errorf("failed to read upload response body: %w", err)
++			}
++			var parsed struct {
++				PendingFile struct {
++					Ref string `json:"ref"`
++				} `json:"pendingFile"`
++			}
++			if err := json.Unmarshal(rawUpload, &parsed); err != nil {
++				return helpers.NewToolResultTextError(
++					"failed to parse upload response: %s (body: %s)", err.Error(), strings.TrimSpace(string(rawUpload)),
++				), nil
++			}
++			if parsed.PendingFile.Ref == "" {
++				return helpers.NewToolResultTextError(
++					"upload succeeded but no pending file reference was returned (body: %s)",
++					strings.TrimSpace(string(rawUpload)),
++				), nil
++			}
++			ref := parsed.PendingFile.Ref
++
++			// Step 2: attach the pending file to the chosen target.
++			var attachReq twapi.HTTPRequester
++			var target string
++			switch {
++			case comment != "":
++				attachReq = commentFileAttachRequest{TaskID: taskID, Body: comment, PendingFileRef: ref}
++				target = fmt.Sprintf("a new comment on task %d", taskID)
++			case taskID != 0:
++				attachReq = taskFileAttachRequest{TaskID: taskID, PendingFileRef: ref}
++				target = fmt.Sprintf("task %d", taskID)
++			default:
++				attachReq = projectFileAttachRequest{ProjectID: projectID, PendingFileRef: ref}
++				target = fmt.Sprintf("project %d", projectID)
++			}
++
++			attachResp, err := twapi.ExecuteRaw(ctx, engine, attachReq)
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to attach file")
++			}
++			defer func() { _ = attachResp.Body.Close() }()
++			if attachResp.StatusCode < 200 || attachResp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(attachResp, "failed to attach file"), "failed to attach file",
++				)
++			}
++
++			return helpers.NewToolResultText("Uploaded %q (ref %s) and attached to %s", fileName, ref, target), nil
++		},
++	}
++}
 diff --git a/internal/twprojects/notifications.go b/internal/twprojects/notifications.go
 new file mode 100644
 index 0000000..83b1834
@@ -364,10 +690,18 @@ index b13830a..e3efdb8 100644
  			)
  			if err != nil {
 diff --git a/internal/twprojects/tools.go b/internal/twprojects/tools.go
-index 39dbce4..f8f930d 100644
+index 39dbce4..066fd73 100644
 --- a/internal/twprojects/tools.go
 +++ b/internal/twprojects/tools.go
-@@ -236,6 +236,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+@@ -99,6 +99,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+ 	tasksWriteTools := []toolsets.ToolWrapper{
+ 		TaskComplete(engine),
+ 		TaskCreate(engine),
++		FileUpload(engine),
+ 		TasklistCreate(engine),
+ 		TasklistUpdate(engine),
+ 		TaskUpdate(engine),
+@@ -236,6 +237,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
  		AddWriteTools(contentWriteTools...).
  		AddReadTools(
  			ActivityList(engine),
