@@ -1,3 +1,594 @@
+diff --git a/internal/twprojects/file_download.go b/internal/twprojects/file_download.go
+new file mode 100644
+index 0000000..f881a0d
+--- /dev/null
++++ b/internal/twprojects/file_download.go
+@@ -0,0 +1,431 @@
++package twprojects
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// List of methods available in the Teamwork.com MCP service.
++const (
++	MethodListTaskFiles toolsets.Method = "twprojects-list_task_files"
++	MethodDownloadFile  toolsets.Method = "twprojects-download_file"
++)
++
++var listTaskFilesOutputSchema *jsonschema.Schema
++
++func init() {
++	var err error
++	listTaskFilesOutputSchema, err = jsonschema.For[listTaskFilesResult](&jsonschema.ForOptions{})
++	if err != nil {
++		panic(fmt.Sprintf("failed to generate JSON schema for listTaskFilesResult: %v", err))
++	}
++}
++
++// taskFile is a single file attached to a task, projected into the output shape.
++type taskFile struct {
++	ID          int64  `json:"id"`
++	Name        string `json:"name"`
++	Size        int64  `json:"size"`
++	ContentType string `json:"content_type"`
++	CreatedAt   string `json:"created_at"`
++	UploadedBy  string `json:"uploaded_by"`
++}
++
++// listTaskFilesResult is the structured payload returned by the list tool.
++type listTaskFilesResult struct {
++	Returned int        `json:"returned"`
++	Files    []taskFile `json:"files"`
++}
++
++// taskFilesRequest is a local HTTP requester for the v1 task files endpoint.
++// The SDK has no type for this endpoint, so the requester lives here (no
++// twapi-go-sdk edit).
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/get-tasks-task-id-files-json
++type taskFilesRequest struct {
++	TaskID int64
++}
++
++// HTTPRequest builds the GET request for a task's files.
++func (r taskFilesRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/tasks/%d/files.json", server, r.TaskID)
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// rawTaskFile is the subset of a file record the list tool reads.
++type rawTaskFile struct {
++	ID          int64  `json:"id"`
++	Name        string `json:"name"`
++	Size        int64  `json:"size"`
++	FileType    string `json:"fileType"`
++	ContentType string `json:"contentType"`
++	CreatedAt   string `json:"createdAt"`
++	UploadedBy  struct {
++		FirstName string `json:"firstName"`
++		LastName  string `json:"lastName"`
++	} `json:"uploadedBy"`
++}
++
++// rawTaskFilesResponse is the subset of the files response the list tool reads.
++type rawTaskFilesResponse struct {
++	Files []rawTaskFile `json:"files"`
++}
++
++// fileMetaRequest is a local HTTP requester for the v1 single-file endpoint,
++// used to resolve a file's download URL and original name before downloading.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/get-files-id-json
++type fileMetaRequest struct {
++	FileID int64
++}
++
++// HTTPRequest builds the GET request for a single file's metadata.
++func (r fileMetaRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/files/%d.json", server, r.FileID)
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// fileVersionMetaRequest is a local HTTP requester for the v1 single
++// file-version endpoint. Teamwork search results (twprojects-search) return
++// file *version* IDs (type "fileVersions"), which the /files/{id}.json
++// endpoint rejects with 404. This endpoint resolves a version to its parent
++// file, whose ID then drives the normal download flow.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/get-files-id-json
++type fileVersionMetaRequest struct {
++	FileVersionID int64
++}
++
++// HTTPRequest builds the GET request for a single file version's metadata.
++func (r fileVersionMetaRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/fileversions/%d.json", server, r.FileVersionID)
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// downloadFileResult is the structured payload returned by the download tool.
++type downloadFileResult struct {
++	SavedTo  string `json:"saved_to"`
++	FileName string `json:"file_name"`
++	Bytes    int64  `json:"bytes"`
++}
++
++// resolveFileVersionParent resolves a file-version ID to its parent file ID
++// via the v1 /fileversions/{id}.json endpoint. It returns 0 (with no error)
++// when the version endpoint also reports the ID as not found, so callers can
++// fall through to a generic not-found response. The v1 API returns the nested
++// file ID as a JSON string, so it is parsed leniently.
++func resolveFileVersionParent(ctx context.Context, engine *twapi.Engine, versionID int64) (int64, error) {
++	resp, err := twapi.ExecuteRaw(ctx, engine, fileVersionMetaRequest{FileVersionID: versionID})
++	if err != nil {
++		return 0, err
++	}
++	body, readErr := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if resp.StatusCode == http.StatusNotFound {
++		return 0, nil
++	}
++	if resp.StatusCode != http.StatusOK {
++		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
++	}
++	if readErr != nil {
++		return 0, fmt.Errorf("failed to read file version metadata body: %w", readErr)
++	}
++
++	var meta struct {
++		FileVersion struct {
++			File struct {
++				ID json.Number `json:"id"`
++			} `json:"file"`
++		} `json:"fileVersion"`
++	}
++	if err := json.Unmarshal(body, &meta); err != nil {
++		return 0, fmt.Errorf("failed to parse file version metadata: %w (body: %s)",
++			err, strings.TrimSpace(string(body)))
++	}
++	parentID, err := meta.FileVersion.File.ID.Int64()
++	if err != nil {
++		return 0, fmt.Errorf("file version %d has no resolvable parent file ID (body: %s)",
++			versionID, strings.TrimSpace(string(body)))
++	}
++	return parentID, nil
++}
++
++// ListTaskFiles lists the files attached to a task.
++func ListTaskFiles(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name:        string(MethodListTaskFiles),
++			Description: "List files attached to a task. Returns file IDs, names, sizes, and uploader info.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "List Task Files",
++				ReadOnlyHint: true,
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"task_id": {
++						Type:        "integer",
++						Description: "The ID of the task whose files should be listed.",
++					},
++				},
++				Required: []string{"task_id"},
++			},
++			OutputSchema: helpers.WithOptionalFields(listTaskFilesOutputSchema),
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var taskID int64
++			err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&taskID, "task_id"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, taskFilesRequest{TaskID: taskID})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to list task files")
++			}
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode != http.StatusOK {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to list task files"),
++					"failed to list task files",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			var decoded rawTaskFilesResponse
++			if err := json.Unmarshal(body, &decoded); err != nil {
++				return nil, fmt.Errorf("failed to decode task files response: %w", err)
++			}
++
++			files := make([]taskFile, 0, len(decoded.Files))
++			for _, f := range decoded.Files {
++				contentType := f.ContentType
++				if contentType == "" {
++					contentType = f.FileType
++				}
++				uploadedBy := strings.TrimSpace(f.UploadedBy.FirstName + " " + f.UploadedBy.LastName)
++				files = append(files, taskFile{
++					ID:          f.ID,
++					Name:        f.Name,
++					Size:        f.Size,
++					ContentType: contentType,
++					CreatedAt:   f.CreatedAt,
++					UploadedBy:  uploadedBy,
++				})
++			}
++
++			result := listTaskFilesResult{
++				Returned: len(files),
++				Files:    files,
++			}
++
++			encoded, err := json.Marshal(result)
++			if err != nil {
++				return nil, fmt.Errorf("failed to encode task files result: %w", err)
++			}
++			return &mcp.CallToolResult{
++				Content: []mcp.Content{
++					&mcp.TextContent{Text: string(encoded)},
++				},
++				StructuredContent: result,
++			}, nil
++		},
++	}
++}
++
++// DownloadFile downloads a Teamwork file by its ID and saves it to local disk.
++// It first resolves the file's signed download URL via the v1 file endpoint,
++// then fetches that URL directly (it carries its own auth and lives outside the
++// /projects/api prefix, so it is not routed through the engine).
++func DownloadFile(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodDownloadFile),
++			Description: "Download a Teamwork file by its ID and save it to a local path. " +
++				"Accepts either a file ID or a file-version ID (Teamwork search results " +
++				"return file-version IDs, type \"fileVersions\"); version IDs are resolved " +
++				"to their parent file automatically. Returns the saved path and file size.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "Download File",
++				ReadOnlyHint: true,
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"file_id": {
++						Type: "integer",
++						Description: "The Teamwork file ID (or file-version ID, as returned by " +
++							"twprojects-search) to download.",
++					},
++					"out_path": {
++						Description: "Absolute local path to save the file. If omitted, saves to /tmp/{filename}.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string"},
++							{Type: "null"},
++						},
++					},
++				},
++				Required: []string{"file_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var fileID int64
++			var outPath string
++			err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&fileID, "file_id"),
++				helpers.OptionalParam(&outPath, "out_path"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			// fetchFileMeta GETs /files/{id}.json and returns the HTTP status
++			// plus the raw body. A separate readErr surfaces body-read failures
++			// without masking the status.
++			fetchFileMeta := func(id int64) (status int, body []byte, readErr error, execErr error) {
++				resp, err := twapi.ExecuteRaw(ctx, engine, fileMetaRequest{FileID: id})
++				if err != nil {
++					return 0, nil, nil, err
++				}
++				b, rErr := io.ReadAll(resp.Body)
++				_ = resp.Body.Close()
++				return resp.StatusCode, b, rErr, nil
++			}
++
++			// Step 1: resolve the download URL and original filename.
++			// `file_id` may be a real file ID or a file-version ID — Teamwork
++			// search (twprojects-search) returns file-version IDs (type
++			// "fileVersions"), which /files/{id}.json rejects with 404. On a 404
++			// we resolve the version to its parent file and retry once.
++			metaStatus, metaBody, readErr, execErr := fetchFileMeta(fileID)
++			if execErr != nil {
++				return helpers.HandleAPIError(execErr, "failed to fetch file metadata")
++			}
++
++			if metaStatus == http.StatusNotFound {
++				parentID, resolveErr := resolveFileVersionParent(ctx, engine, fileID)
++				if resolveErr != nil {
++					return helpers.NewToolResultTextError(
++						"file %d not found, and resolving it as a file-version ID failed: %s",
++						fileID, resolveErr.Error(),
++					), nil
++				}
++				if parentID != 0 {
++					metaStatus, metaBody, readErr, execErr = fetchFileMeta(parentID)
++					if execErr != nil {
++						return helpers.HandleAPIError(execErr, "failed to fetch file metadata")
++					}
++				}
++			}
++
++			if metaStatus != http.StatusOK {
++				return helpers.NewToolResultTextError(
++					"failed to fetch file metadata for %d (HTTP %d): %s",
++					fileID, metaStatus, strings.TrimSpace(string(metaBody)),
++				), nil
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read file metadata body: %w", readErr)
++			}
++
++			var meta struct {
++				File struct {
++					Name        string `json:"name"`
++					DownloadURL string `json:"download-URL"`
++				} `json:"file"`
++			}
++			if err := json.Unmarshal(metaBody, &meta); err != nil {
++				return helpers.NewToolResultTextError(
++					"failed to parse file metadata: %s (body: %s)", err.Error(), strings.TrimSpace(string(metaBody)),
++				), nil
++			}
++			if meta.File.DownloadURL == "" {
++				return helpers.NewToolResultTextError(
++					"file %d has no download URL (body: %s)", fileID, strings.TrimSpace(string(metaBody)),
++				), nil
++			}
++
++			fileName := meta.File.Name
++			if outPath == "" {
++				if fileName == "" {
++					fileName = fmt.Sprintf("teamwork-file-%d", fileID)
++				}
++				outPath = filepath.Join(os.TempDir(), fileName)
++			} else if fileName == "" {
++				fileName = filepath.Base(outPath)
++			}
++
++			// Step 2: fetch the signed URL directly (not through the engine).
++			dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, meta.File.DownloadURL, nil)
++			if err != nil {
++				return nil, fmt.Errorf("failed to build download request: %w", err)
++			}
++			dlResp, err := http.DefaultClient.Do(dlReq)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to download file: %s", err.Error()), nil
++			}
++			defer func() { _ = dlResp.Body.Close() }()
++			if dlResp.StatusCode < 200 || dlResp.StatusCode >= 300 {
++				return helpers.NewToolResultTextError(
++					"download failed with status %d", dlResp.StatusCode,
++				), nil
++			}
++
++			out, err := os.Create(outPath)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to create %q: %s", outPath, err.Error()), nil
++			}
++			written, err := io.Copy(out, dlResp.Body)
++			closeErr := out.Close()
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to write file to %q: %s", outPath, err.Error()), nil
++			}
++			if closeErr != nil {
++				return helpers.NewToolResultTextError("failed to finalise %q: %s", outPath, closeErr.Error()), nil
++			}
++
++			result := downloadFileResult{
++				SavedTo:  outPath,
++				FileName: fileName,
++				Bytes:    written,
++			}
++			encoded, err := json.Marshal(result)
++			if err != nil {
++				return nil, fmt.Errorf("failed to encode download result: %w", err)
++			}
++			return &mcp.CallToolResult{
++				Content: []mcp.Content{
++					&mcp.TextContent{Text: string(encoded)},
++				},
++				StructuredContent: result,
++			}, nil
++		},
++	}
++}
+diff --git a/internal/twprojects/file_download_test.go b/internal/twprojects/file_download_test.go
+new file mode 100644
+index 0000000..8c1cc9b
+--- /dev/null
++++ b/internal/twprojects/file_download_test.go
+@@ -0,0 +1,148 @@
++package twprojects_test
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/testutil"
++	"github.com/teamwork/mcp/internal/twprojects"
++)
++
++// downloadResultSavedTo digs the saved path out of the structured tool result.
++func downloadResultSavedTo(t *testing.T, result mcp.Result) string {
++	t.Helper()
++	callResult, ok := result.(*mcp.CallToolResult)
++	if !ok {
++		t.Fatalf("unexpected result type %T", result)
++	}
++	if callResult.IsError {
++		var msg string
++		for _, c := range callResult.Content {
++			if tc, ok := c.(*mcp.TextContent); ok {
++				msg += tc.Text
++			}
++		}
++		t.Fatalf("tool returned error: %s", msg)
++	}
++	var payload struct {
++		SavedTo  string `json:"saved_to"`
++		FileName string `json:"file_name"`
++		Bytes    int64  `json:"bytes"`
++	}
++	for _, c := range callResult.Content {
++		if tc, ok := c.(*mcp.TextContent); ok {
++			if err := json.Unmarshal([]byte(tc.Text), &payload); err == nil && payload.SavedTo != "" {
++				return payload.SavedTo
++			}
++		}
++	}
++	t.Fatalf("could not find saved_to in result content")
++	return ""
++}
++
++// TestDownloadFileByVersionID covers the search-driven path: the caller passes
++// a file-version ID, /files/{id}.json 404s, and the tool resolves the version
++// to its parent file before downloading.
++func TestDownloadFileByVersionID(t *testing.T) {
++	const versionID = "999"
++	const parentID = "123"
++	const contents = "hello from teamwork"
++
++	// Stand-in for the signed download URL the file metadata points at.
++	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = w.Write([]byte(contents))
++	}))
++	defer blob.Close()
++
++	fileBody := []byte(`{"file":{"name":"report.pdf","download-URL":"` + blob.URL + `"}}`)
++	versionBody := []byte(`{"fileVersion":{"file":{"id":"` + parentID + `"},"name":"report.pdf"}}`)
++
++	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, []testutil.ProjectsMockRoute{
++		// The version-ID file lookup must 404 to trigger the fallback.
++		{Match: "/files/" + versionID + ".json", Status: http.StatusNotFound,
++			Body: []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`)},
++		// The version endpoint resolves the parent file ID.
++		{Match: "/fileversions/" + versionID + ".json", Status: http.StatusOK, Body: versionBody},
++		// The parent file lookup yields the download URL.
++		{Match: "/files/" + parentID + ".json", Status: http.StatusOK, Body: fileBody},
++	}, http.StatusNotFound, []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`))
++
++	outPath := filepath.Join(t.TempDir(), "report.pdf")
++	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
++		"file_id":  float64(999),
++		"out_path": outPath,
++	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
++		saved := downloadResultSavedTo(t, result)
++		if saved != outPath {
++			t.Errorf("saved_to = %q, want %q", saved, outPath)
++		}
++		got, err := os.ReadFile(outPath)
++		if err != nil {
++			t.Fatalf("failed to read downloaded file: %v", err)
++		}
++		if string(got) != contents {
++			t.Errorf("downloaded contents = %q, want %q", string(got), contents)
++		}
++	}))
++}
++
++// TestDownloadFileByFileID covers the direct path: a real file ID resolves on
++// the first /files/{id}.json call with no version fallback.
++func TestDownloadFileByFileID(t *testing.T) {
++	const fileID = "456"
++	const contents = "direct download"
++
++	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = w.Write([]byte(contents))
++	}))
++	defer blob.Close()
++
++	fileBody := []byte(`{"file":{"name":"direct.txt","download-URL":"` + blob.URL + `"}}`)
++	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, []testutil.ProjectsMockRoute{
++		{Match: "/files/" + fileID + ".json", Status: http.StatusOK, Body: fileBody},
++	}, http.StatusNotFound, nil)
++
++	outPath := filepath.Join(t.TempDir(), "direct.txt")
++	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
++		"file_id":  float64(456),
++		"out_path": outPath,
++	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
++		if got := downloadResultSavedTo(t, result); got != outPath {
++			t.Errorf("saved_to = %q, want %q", got, outPath)
++		}
++	}))
++}
++
++// TestDownloadFileNotFound covers a genuinely missing ID: both the file and the
++// file-version lookups 404, so the tool returns a clear error.
++func TestDownloadFileNotFound(t *testing.T) {
++	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, nil,
++		http.StatusNotFound, []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`))
++
++	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
++		"file_id": float64(404404),
++	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
++		callResult, ok := result.(*mcp.CallToolResult)
++		if !ok {
++			t.Fatalf("unexpected result type %T", result)
++		}
++		if !callResult.IsError {
++			t.Fatalf("expected an error result for a missing file ID")
++		}
++		var msg string
++		for _, c := range callResult.Content {
++			if tc, ok := c.(*mcp.TextContent); ok {
++				msg += tc.Text
++			}
++		}
++		if !strings.Contains(msg, "failed to fetch file metadata") {
++			t.Errorf("error message = %q, want it to mention metadata fetch failure", msg)
++		}
++	}))
++}
 diff --git a/internal/twprojects/files.go b/internal/twprojects/files.go
 new file mode 100644
 index 0000000..e054d31
@@ -690,7 +1281,7 @@ index b13830a..e3efdb8 100644
  			)
  			if err != nil {
 diff --git a/internal/twprojects/tools.go b/internal/twprojects/tools.go
-index 39dbce4..066fd73 100644
+index 39dbce4..a08a227 100644
 --- a/internal/twprojects/tools.go
 +++ b/internal/twprojects/tools.go
 @@ -99,6 +99,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
@@ -701,11 +1292,13 @@ index 39dbce4..066fd73 100644
  		TasklistCreate(engine),
  		TasklistUpdate(engine),
  		TaskUpdate(engine),
-@@ -236,6 +237,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+@@ -236,6 +237,9 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
  		AddWriteTools(contentWriteTools...).
  		AddReadTools(
  			ActivityList(engine),
 +			MyNotifications(engine),
++			ListTaskFiles(engine),
++			DownloadFile(engine),
  			CommentGet(engine),
  			CommentList(engine),
  			MilestoneGet(engine),
