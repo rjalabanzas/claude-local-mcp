@@ -1302,3 +1302,219 @@ index 39dbce4..a08a227 100644
  			CommentGet(engine),
  			CommentList(engine),
  			MilestoneGet(engine),
+diff --git a/internal/twprojects/notebooks.go b/internal/twprojects/notebooks.go
+index 502bc6c..d169455 100644
+--- a/internal/twprojects/notebooks.go
++++ b/internal/twprojects/notebooks.go
+@@ -1,6 +1,7 @@
+ package twprojects
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -48,6 +49,57 @@ func init() {
+ 	helpers.WithMetaWebLinkSchema(notebookListOutputSchema)
+ }
+ 
++// notebookPrivacy is the v3 privacy object: the users, companies, and teams
++// granted access when a notebook is private. The SDK's NotebookCreateRequest
++// does not model privacy, so it is built here and sent via ExecuteRaw.
++type notebookPrivacy struct {
++	UserIDs    []int64 `json:"userIds,omitempty"`
++	CompanyIDs []int64 `json:"companyIds,omitempty"`
++	TeamIDs    []int64 `json:"teamIds,omitempty"`
++}
++
++// notebookCreatePayload is the request body for the v3 create-notebook
++// endpoint, including the isPrivate/privacy fields the SDK type omits.
++type notebookCreatePayload struct {
++	Name        string           `json:"name"`
++	Description *string          `json:"description,omitempty"`
++	Contents    string           `json:"contents"`
++	Type        string           `json:"type"`
++	TagIDs      []int64          `json:"tagIds,omitempty"`
++	IsPrivate   *bool            `json:"isPrivate,omitempty"`
++	Privacy     *notebookPrivacy `json:"privacy,omitempty"`
++}
++
++// notebookCreateRequester is a local HTTP requester for the v3 create-notebook
++// endpoint. It exists (instead of the SDK's projects.NotebookCreate) so the
++// request body can carry isPrivate/privacy, which the SDK type does not model —
++// no twapi-go-sdk edit.
++type notebookCreateRequester struct {
++	projectID int64
++	payload   notebookCreatePayload
++}
++
++// HTTPRequest builds the POST request for creating a notebook.
++func (r notebookCreateRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/projects/api/v3/projects/%d/notebooks.json", server, r.projectID)
++
++	body := struct {
++		Notebook notebookCreatePayload `json:"notebook"`
++	}{Notebook: r.payload}
++
++	var buf bytes.Buffer
++	if err := json.NewEncoder(&buf).Encode(body); err != nil {
++		return nil, fmt.Errorf("failed to encode create notebook request: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &buf)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
+ // NotebookCreate creates a notebook in Teamwork.com.
+ func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 	return toolsets.ToolWrapper{
+@@ -85,39 +137,110 @@ func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						Enum:        []any{"MARKDOWN", "HTML"},
+ 					},
+ 					"tag_ids": helpers.TagIDsAssociateSchema("notebook"),
++					"private": {
++						Type: "boolean",
++						Description: "When true, the notebook is private — visible only to the users, companies, " +
++							"and teams listed in privacy_user_ids/privacy_company_ids/privacy_team_ids (plus site " +
++							"administrators in the owner company, who always retain access). Defaults to false, " +
++							"which makes the notebook visible to everyone on the project. If true with no IDs " +
++							"provided, only the creator and site admins can see it.",
++					},
++					"privacy_user_ids": {
++						Description: "User IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
++					"privacy_company_ids": {
++						Description: "Company IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
++					"privacy_team_ids": {
++						Description: "Team IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
+ 				},
+ 				Required: []string{"name", "project_id", "contents", "type"},
+ 			},
+ 		},
+ 		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+-			var notebookCreateRequest projects.NotebookCreateRequest
+-
+ 			var arguments map[string]any
+ 			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
+ 				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
+ 			}
++
++			var projectID int64
++			var payload notebookCreatePayload
++			var nbType projects.NotebookType
++			var private bool
++			var privacy notebookPrivacy
+ 			err := helpers.ParamGroup(arguments,
+-				helpers.RequiredNumericParam(&notebookCreateRequest.Path.ProjectID, "project_id"),
+-				helpers.RequiredParam(&notebookCreateRequest.Name, "name"),
+-				helpers.OptionalPointerParam(&notebookCreateRequest.Description, "description"),
+-				helpers.RequiredParam(&notebookCreateRequest.Contents, "contents"),
+-				helpers.RequiredParam(&notebookCreateRequest.Type, "type",
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++				helpers.RequiredParam(&payload.Name, "name"),
++				helpers.OptionalPointerParam(&payload.Description, "description"),
++				helpers.RequiredParam(&payload.Contents, "contents"),
++				helpers.RequiredParam(&nbType, "type",
+ 					helpers.RestrictValues(
+ 						projects.NotebookTypeMarkdown,
+ 						projects.NotebookTypeHTML,
+ 					),
+ 				),
+-				helpers.OptionalNumericListParam(&notebookCreateRequest.TagIDs, "tag_ids"),
++				helpers.OptionalNumericListParam(&payload.TagIDs, "tag_ids"),
++				helpers.OptionalParam(&private, "private"),
++				helpers.OptionalNumericListParam(&privacy.UserIDs, "privacy_user_ids"),
++				helpers.OptionalNumericListParam(&privacy.CompanyIDs, "privacy_company_ids"),
++				helpers.OptionalNumericListParam(&privacy.TeamIDs, "privacy_team_ids"),
+ 			)
+ 			if err != nil {
+ 				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
+ 			}
++			payload.Type = string(nbType)
++
++			// Only send privacy when the notebook is explicitly private; otherwise
++			// the API default (visible to everyone on the project) applies. The
++			// privacy object is included only when at least one grantee was given.
++			if private {
++				payload.IsPrivate = &private
++				if len(privacy.UserIDs) > 0 || len(privacy.CompanyIDs) > 0 || len(privacy.TeamIDs) > 0 {
++					payload.Privacy = &privacy
++				}
++			}
+ 
+-			notebookResponse, err := projects.NotebookCreate(ctx, engine, notebookCreateRequest)
++			resp, err := twapi.ExecuteRaw(ctx, engine, notebookCreateRequester{
++				projectID: projectID,
++				payload:   payload,
++			})
+ 			if err != nil {
+ 				return helpers.HandleAPIError(err, "failed to create notebook")
+ 			}
+-			return helpers.NewToolResultText("Notebook created successfully with ID %d", notebookResponse.Notebook.ID), nil
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode != http.StatusCreated {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to create notebook"),
++					"failed to create notebook",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			var decoded struct {
++				Notebook struct {
++					ID int64 `json:"id"`
++				} `json:"notebook"`
++			}
++			if err := json.Unmarshal(body, &decoded); err != nil {
++				return nil, fmt.Errorf("failed to decode create notebook response: %w", err)
++			}
++			return helpers.NewToolResultText("Notebook created successfully with ID %d", decoded.Notebook.ID), nil
+ 		},
+ 	}
+ }
+diff --git a/internal/twprojects/notebooks_test.go b/internal/twprojects/notebooks_test.go
+index 4375f04..8d6f42c 100644
+--- a/internal/twprojects/notebooks_test.go
++++ b/internal/twprojects/notebooks_test.go
+@@ -20,6 +20,20 @@ func TestNotebookCreate(t *testing.T) {
+ 	})
+ }
+ 
++func TestNotebookCreatePrivate(t *testing.T) {
++	mcpServer := mcpServerMock(t, http.StatusCreated, []byte(`{"notebook":{"id":123}}`))
++	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodNotebookCreate.String(), map[string]any{
++		"name":                "Private Example",
++		"project_id":          float64(123),
++		"contents":            "Confidential content.",
++		"type":                "HTML",
++		"private":             true,
++		"privacy_user_ids":    []float64{10, 11},
++		"privacy_company_ids": []float64{20},
++		"privacy_team_ids":    []float64{30},
++	})
++}
++
+ func TestNotebookUpdate(t *testing.T) {
+ 	mcpServer := mcpServerMock(t, http.StatusOK, []byte(`{}`))
+ 	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodNotebookUpdate.String(), map[string]any{
