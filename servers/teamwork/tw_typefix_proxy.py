@@ -10,6 +10,9 @@ Credentials are read from the environment and passed straight to the child.
 import sys, os, json, subprocess, threading
 
 TW_BIN = os.environ.get("TW_MCP_BIN") or "/Users/rjalabanzas/ClaudeOS/Code Repos/teamwork-mcp/tw-mcp"
+# On Windows the Go build emits tw-mcp.exe; the config path carries no extension.
+if not os.path.exists(TW_BIN) and os.path.exists(TW_BIN + ".exe"):
+    TW_BIN += ".exe"
 
 TOOLTYPES = {}
 _lock = threading.Lock()

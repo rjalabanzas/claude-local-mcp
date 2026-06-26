@@ -1,5 +1,5 @@
 {
-  "command": "/usr/bin/python3",
+  "command": "${BIN:python3}",
   "args": ["${REPO}/servers/teamwork/tw_typefix_proxy.py"],
   "env": {
     "TW_MCP_BEARER_TOKEN": "${SECRET:TW_MCP_BEARER_TOKEN}",

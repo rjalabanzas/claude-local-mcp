@@ -1,9 +1,10 @@
 # claude-local-mcp
 
-One repo to set up my local Claude/Cowork MCP servers on any Mac. Clone it, run
-one script, pick the servers that machine needs, do the per-server logins.
+One repo to set up my local Claude/Cowork MCP servers on any Mac **or Windows
+PC**. Clone it, run one script, pick the servers that machine needs, do the
+per-server logins.
 
-## Quick start
+## Quick start (macOS)
 
 ```bash
 git clone <this-repo-url> ~/ClaudeOS/Code\ Repos/claude-local-mcp
@@ -20,6 +21,31 @@ You install **only what a machine needs** — it's not all-or-nothing.
 > ⚠️ Quit Cowork/Claude (Cmd+Q) before running — the app rewrites its config file
 > on quit, so edits made while it's open are lost. The installer refuses to run
 > while it's open.
+
+## Quick start (Windows)
+
+The installer is the same bash script — run it inside **Git Bash** (ships with
+[Git for Windows](https://git-scm.com/download/win)). Plain PowerShell/CMD won't
+run the `.sh` scripts.
+
+1. Install the prerequisites for the servers you want, and make sure each is on
+   your `PATH` (open a fresh terminal after installing):
+   - **All servers:** [Git for Windows](https://git-scm.com/download/win) (gives you Git Bash)
+   - `ms365` → [Node.js LTS](https://nodejs.org) (provides `npx`)
+   - `telegram` → [uv](https://docs.astral.sh/uv/getting-started/installation/) + [Python 3](https://www.python.org/downloads/)
+   - `teamwork` → [Go](https://go.dev/dl/) + Python 3 (for the build check) + Node.js (to mint the bearer token)
+2. Open **Git Bash** and run:
+   ```bash
+   git clone <this-repo-url> "$HOME/claude-local-mcp"
+   cd "$HOME/claude-local-mcp"
+   ./bootstrap.sh ms365 telegram teamwork    # or --list / --all / interactive
+   ```
+3. Fully quit Claude/Cowork first (it rewrites its config — at
+   `%APPDATA%\Claude\claude_desktop_config.json` on Windows — when it closes).
+   The installer refuses to run while it's open.
+
+> The installer auto-detects Windows: it writes to the `%APPDATA%\Claude` config
+> path and resolves `python`/`python3` and the `.exe` build outputs for you.
 
 ## Servers
 

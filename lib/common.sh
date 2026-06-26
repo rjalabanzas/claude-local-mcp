@@ -16,9 +16,15 @@ die()  { printf '%s%s%s\n' "$(_c '1;31')" "✗ $*" "$(_c 0)" >&2; exit 1; }
 # --- binary resolution (PATH first, then common install locations) ---
 # Usage: resolve_bin uv  -> prints absolute path or empty
 resolve_bin() {
-  local name="$1" p
+  local name="$1" p alt=""
   p="$(command -v "$name" 2>/dev/null || true)"
   [ -n "$p" ] && { echo "$p"; return 0; }
+  # python is `python3` on mac/linux but usually `python` on Windows; try both.
+  case "$name" in python3) alt=python;; python) alt=python3;; esac
+  if [ -n "$alt" ]; then
+    p="$(command -v "$alt" 2>/dev/null || true)"
+    [ -n "$p" ] && { echo "$p"; return 0; }
+  fi
   for p in "$HOME/.local/bin/$name" "/usr/local/go/bin/$name" \
            "/opt/homebrew/bin/$name" "/usr/local/bin/$name" "/usr/bin/$name"; do
     [ -x "$p" ] && { echo "$p"; return 0; }
@@ -37,7 +43,14 @@ require_bins() {
 
 # --- refuse to touch config while Claude/Cowork is running ---
 assert_claude_quit() {
-  if pgrep -fl 'Claude.app' >/dev/null 2>&1; then
-    die "Claude/Cowork is running. Fully quit it (Cmd+Q), then re-run."
-  fi
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)   # Windows (Git Bash / WSL-MSYS)
+      if tasklist 2>/dev/null | grep -qi 'Claude.exe'; then
+        die "Claude/Cowork is running. Fully quit it, then re-run."
+      fi ;;
+    *)
+      if pgrep -fl 'Claude.app' >/dev/null 2>&1; then
+        die "Claude/Cowork is running. Fully quit it (Cmd+Q), then re-run."
+      fi ;;
+  esac
 }

@@ -18,9 +18,35 @@ Secrets are NEVER read from or written to this repo — only into the config fil
 
 Usage: install_config.py <repo_root> <server1> [server2 ...]
 """
-import json, os, sys, time, shutil, getpass, shutil as _sh
+import json, os, sys, time, shutil, getpass, subprocess, shutil as _sh
 
-CFG = os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+
+def _config_path():
+    """Claude/Cowork config location, per OS."""
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~/AppData/Roaming')
+        return os.path.join(base, 'Claude', 'claude_desktop_config.json')
+    if sys.platform == 'darwin':
+        return os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    return os.path.join(base, 'Claude', 'claude_desktop_config.json')
+
+
+CFG = _config_path()
+
+
+def claude_is_running():
+    """True if Claude/Cowork is running (it rewrites the config on quit)."""
+    try:
+        if sys.platform == 'win32':
+            out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq Claude.exe'],
+                                 capture_output=True, text=True).stdout
+            return 'Claude.exe' in out
+        out = subprocess.run(['pgrep', '-fl', 'Claude.app'],
+                             capture_output=True, text=True).stdout
+        return 'Claude.app' in out
+    except Exception:
+        return False
 
 
 def fail(msg):
@@ -31,6 +57,12 @@ def resolve_bin(name):
     p = _sh.which(name)
     if p:
         return p
+    # python is `python3` on mac/linux but usually `python` on Windows; try both.
+    alt = {'python3': 'python', 'python': 'python3'}.get(name)
+    if alt:
+        p = _sh.which(alt)
+        if p:
+            return p
     for cand in (f"{os.path.expanduser('~')}/.local/bin/{name}",
                  f"/usr/local/go/bin/{name}", "/opt/homebrew/bin/" + name,
                  f"/usr/local/bin/{name}", f"/usr/bin/{name}"):
@@ -92,8 +124,8 @@ def main():
     repo = os.path.abspath(sys.argv[1])
     servers = sys.argv[2:]
 
-    if 'Claude.app' in os.popen("pgrep -fl 'Claude.app' 2>/dev/null").read():
-        fail("Claude/Cowork is running. Fully quit it (Cmd+Q), then re-run.")
+    if claude_is_running():
+        fail("Claude/Cowork is running. Fully quit it, then re-run.")
 
     os.makedirs(os.path.dirname(CFG), exist_ok=True)
     cfg = {}
