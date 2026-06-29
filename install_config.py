@@ -106,11 +106,16 @@ def expand(obj, repo, existing_env, secret_cache, vars=None):
         i = s.index("${BIN:"); j = s.index("}", i)
         name = s[i + 6:j]
         s = s[:i] + resolve_bin(name) + s[j + 1:]
-    # ${OSEXE:base} -> base (POSIX) / base.cmd (Windows)
+    # ${OSEXE:base} -> base (POSIX) / base.cmd (Windows) — a launchable script
     while "${OSEXE:" in s:
         i = s.index("${OSEXE:"); j = s.index("}", i)
         base = s[i + 8:j]
         s = s[:i] + (base + ".cmd" if sys.platform == "win32" else base) + s[j + 1:]
+    # ${OSBIN:base} -> base (POSIX) / base.exe (Windows) — a native binary
+    while "${OSBIN:" in s:
+        i = s.index("${OSBIN:"); j = s.index("}", i)
+        base = s[i + 8:j]
+        s = s[:i] + (base + ".exe" if sys.platform == "win32" else base) + s[j + 1:]
     # ${SECRET:KEY}
     while "${SECRET:" in s:
         i = s.index("${SECRET:"); j = s.index("}", i)
@@ -160,6 +165,8 @@ def prompt_instance(inst, mcp):
                 val = val.lower()
                 if not re.fullmatch(r"[a-z]{1,4}", val):
                     print("    → must be 1–4 letters (a–z only, no spaces or digits)"); continue
+            if validate == "email" and "@" not in val:
+                print("    → enter a valid email address"); continue
             vars[var] = val
             break
     key = inst["key"]
@@ -221,6 +228,8 @@ def main():
     for name, key, vars in instances:
         if name == "ms365":
             print(f"  {key}: authenticate with  ./servers/ms365/login.sh {vars['PREFIX']}")
+        elif name == "google":
+            print(f"  {key}: authenticate with  ./servers/google/login.sh {vars['PREFIX']} <credentials.json>")
     print("  Launch Cowork to load the changes.")
 
 

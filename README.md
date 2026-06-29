@@ -53,6 +53,7 @@ run the `.sh` scripts.
 |---|---|---|---|
 | `teamwork` | Projects/Desk/Spaces (`tw-mcp`, patched for due-date/overdue) | from **official** upstream + our patch, provenance-verified | paste bearer token |
 | `ms365` | Outlook/Calendar/SharePoint/Teams/etc. (one entry **per account**) | config only (`npx`) | `./servers/ms365/login.sh <prefix>` (device-code; per-account file) |
+| `google` | Gmail/Calendar/Drive/Docs/Sheets/Contacts/Tasks (gogcli; one entry **per account**) | downloads `gog` binary | `./servers/google/login.sh <prefix> <credentials.json>` (OAuth; per-account file) |
 | `readai` | Read.ai meetings/transcripts | vendored (own code) | `uv run servers/readai/auth.py` |
 | `telegram` | Telegram | vendored (chigwell + my patch) | phone login on first run |
 | `outlook` | Outlook (community server, calendar fix) | vendored + `npm build` | OAuth (uses ms365 app) |
@@ -97,11 +98,42 @@ Credentials bypass the keychain via a small file-based auth-cache wrapper
 (`ms365-auth-cache`), which is what keeps the accounts isolated. The `.creds/`
 dir is git-ignored.
 
+### google: multiple accounts
+
+`google` wraps [`gogcli`](https://gogcli.sh) (the `gog` binary) and, like `ms365`,
+is installed **once per Google account** — each becomes its own MCP
+(`google-<prefix>`, tools `mcp__google-<prefix>__…`) with its own credentials.
+
+**One-time per account — create a Google OAuth client:** in
+[Google Cloud Console](https://console.cloud.google.com) create (or pick) a
+project, enable the APIs you want (Gmail, Calendar, Drive, …), then
+**APIs & Services → Credentials → Create credentials → OAuth client ID →
+Desktop app**, and download its `credentials.json`. You chose **a separate
+client per account**, so do this once for each account.
+
+Then install + log in each account:
+
+```bash
+./bootstrap.sh google                              # asks: 4-letter prefix + email + a keyring passphrase
+./servers/google/login.sh work ~/Downloads/work-client.json   # stores the client, opens browser to authorize
+./servers/google/login.sh prsl ~/Downloads/prsl-client.json
+```
+
+- **prefix** (≤4 letters) → names the MCP `google-<prefix>` and the OAuth client bucket.
+- **email** → the account `gog` pins this server to (`--account`).
+- **keyring passphrase** → encrypts that account's local token file (`GOG_KEYRING_BACKEND=file`,
+  so Claude can launch the server without macOS Keychain prompts).
+
+Each account's client + tokens live under `servers/google/.creds/<prefix>/`
+(via `GOG_HOME`); the `gog` binary and `.creds/` are git-ignored. The MCP is
+started with `--allow-write` (Gmail send, Drive/Docs edits, etc.) — drop that
+flag in `config.json` for a read-only server.
+
 ### Adding a new MCP later
 
 Drop a new `servers/<name>/` folder with `manifest.sh`, `setup.sh`, and
 `config.json`. No edits to `bootstrap.sh` — it's picked up automatically.
-A server that installs once-per-account (like `ms365`) adds a top-level
+A server that installs once-per-account (like `ms365`/`google`) adds a top-level
 `__instance__` block to its `config.json` — see `install_config.py` for the format.
 
 ## Security

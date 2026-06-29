@@ -1,0 +1,16 @@
+{
+  "__instance__": {
+    "key": "google-${PREFIX}",
+    "prompts": [
+      { "var": "PREFIX", "label": "short tool-name prefix, max 4 letters (e.g. work, prsl) — sets the MCP name google-<prefix>", "validate": "prefix" },
+      { "var": "EMAIL", "label": "the Google account email for this instance (e.g. you@gmail.com)", "validate": "email" }
+    ]
+  },
+  "command": "${OSBIN:${REPO}/servers/google/bin/gog}",
+  "args": ["--client", "${PREFIX}", "--account", "${EMAIL}", "mcp", "--allow-write"],
+  "env": {
+    "GOG_HOME": "${REPO}/servers/google/.creds/${PREFIX}",
+    "GOG_KEYRING_BACKEND": "file",
+    "GOG_KEYRING_PASSWORD": "${SECRET:GOG_KEYRING_PASSWORD}"
+  }
+}

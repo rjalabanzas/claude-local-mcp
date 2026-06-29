@@ -18,6 +18,9 @@ claude_desktop_config.json
 ~/.config/readai-mcp/
 # ms365: per-account MSAL token caches (one dir per instance prefix)
 servers/ms365/.creds/
+# google (gogcli): downloaded binary + per-account config/tokens (GOG_HOME)
+servers/google/bin/
+servers/google/.creds/
 
 # ── build artifacts (rebuilt by setup.sh) ────────────────────────────────
 servers/teamwork/bin/
