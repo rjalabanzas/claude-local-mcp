@@ -1,4 +1,4 @@
 SERVER_NAME="ms365"
-SERVER_DESC="Microsoft 365 — Outlook/Calendar/SharePoint/Teams/OneDrive/Planner (@softeria/ms-365-mcp-server)"
+SERVER_DESC="Microsoft 365 — Outlook/Calendar/SharePoint/Teams/OneDrive/Planner (@softeria/ms-365-mcp-server). Install once per account: prompts for a domain + 4-letter prefix → MCP 'ms365-<prefix>'."
 SERVER_PREREQS="npx"
-SERVER_AUTH="device-code login on first use (a code to enter in the browser; token cached in the macOS keychain — no secret to paste)"
+SERVER_AUTH="per instance, run  ./servers/ms365/login.sh <prefix>  (device-code login; token saved to servers/ms365/.creds/<prefix>/, not the keychain — so accounts stay separate)"

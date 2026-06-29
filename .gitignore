@@ -16,6 +16,8 @@ claude_desktop_config.json
 **/store/*.db
 **/whatsapp-bridge/store/
 ~/.config/readai-mcp/
+# ms365: per-account MSAL token caches (one dir per instance prefix)
+servers/ms365/.creds/
 
 # ── build artifacts (rebuilt by setup.sh) ────────────────────────────────
 servers/teamwork/bin/

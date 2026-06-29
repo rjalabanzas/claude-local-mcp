@@ -12,13 +12,29 @@ Placeholders supported in a server's config.json:
   ${REPO}          -> absolute path of this bootstrap repo
   ${HOME}          -> user home dir
   ${BIN:name}      -> absolute path to `name` (uv/node/python3/...), resolved via PATH
+  ${OSEXE:base}    -> `base` on macOS/Linux, `base.cmd` on Windows (for a wrapper
+                      executable Node must spawn directly, shell:false)
   ${SECRET:KEY}    -> prompted once via hidden input; reuses existing value if the
                       server entry already has env[KEY] in the current config
+  ${ASK:KEY}       -> visible prompt for a non-secret required value; reuses existing
+  ${VAR}           -> an instance variable (see below), e.g. ${PREFIX}, ${TENANT}
 Secrets are NEVER read from or written to this repo — only into the config file.
+
+Multi-instance servers (e.g. ms365 — one entry per account):
+  A config.json may carry a top-level "__instance__" object:
+      "__instance__": {
+        "key": "ms365-${PREFIX}",                  # the config key this writes to
+        "prompts": [ {"var": "PREFIX", "label": "...", "validate": "prefix"},
+                     {"var": "TENANT", "label": "...", "default": "common"} ]
+      }
+  A prompt with "default" uses that value when the user enters nothing (otherwise
+  a blank answer aborts). Each prompt is exposed as a ${VAR} placeholder; the
+  resolved "key" is where the entry is written, so installing the same server
+  again with a different prefix ADDS another instance instead of overwriting.
 
 Usage: install_config.py <repo_root> <server1> [server2 ...]
 """
-import json, os, sys, time, shutil, getpass, subprocess, shutil as _sh
+import json, os, re, sys, time, shutil, getpass, subprocess, shutil as _sh
 
 
 def _config_path():
@@ -71,21 +87,30 @@ def resolve_bin(name):
     fail(f"could not resolve required binary: {name}")
 
 
-def expand(obj, repo, existing_env, secret_cache):
+def expand(obj, repo, existing_env, secret_cache, vars=None):
     """Recursively expand ${...} placeholders in strings."""
+    vars = vars or {}
     if isinstance(obj, dict):
-        return {k: expand(v, repo, existing_env, secret_cache) for k, v in obj.items()}
+        return {k: expand(v, repo, existing_env, secret_cache, vars) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [expand(v, repo, existing_env, secret_cache) for v in obj]
+        return [expand(v, repo, existing_env, secret_cache, vars) for v in obj]
     if not isinstance(obj, str):
         return obj
     s = obj
     s = s.replace("${REPO}", repo).replace("${HOME}", os.path.expanduser("~"))
+    # instance vars: ${PREFIX}, ${DOMAIN}, ... (done before BIN/OSEXE so paths resolve)
+    for k, v in vars.items():
+        s = s.replace("${" + k + "}", v)
     # ${BIN:name}
     while "${BIN:" in s:
         i = s.index("${BIN:"); j = s.index("}", i)
         name = s[i + 6:j]
         s = s[:i] + resolve_bin(name) + s[j + 1:]
+    # ${OSEXE:base} -> base (POSIX) / base.cmd (Windows)
+    while "${OSEXE:" in s:
+        i = s.index("${OSEXE:"); j = s.index("}", i)
+        base = s[i + 8:j]
+        s = s[:i] + (base + ".cmd" if sys.platform == "win32" else base) + s[j + 1:]
     # ${SECRET:KEY}
     while "${SECRET:" in s:
         i = s.index("${SECRET:"); j = s.index("}", i)
@@ -118,6 +143,33 @@ def expand(obj, repo, existing_env, secret_cache):
     return s
 
 
+def prompt_instance(inst, mcp):
+    """Ask the instance prompts; return (config_key, vars). Asked before any write."""
+    vars = {}
+    for p in inst.get("prompts", []):
+        var, label, validate = p["var"], p["label"], p.get("validate")
+        default = p.get("default")
+        while True:
+            val = input(f"  {label}: ").strip()
+            if not val:
+                if default is not None:
+                    val = default
+                else:
+                    fail(f"no value entered for {var} — aborted, nothing changed")
+            if validate == "prefix":
+                val = val.lower()
+                if not re.fullmatch(r"[a-z]{1,4}", val):
+                    print("    → must be 1–4 letters (a–z only, no spaces or digits)"); continue
+            vars[var] = val
+            break
+    key = inst["key"]
+    for k, v in vars.items():
+        key = key.replace("${" + k + "}", v)
+    if key in mcp:
+        print(f"  note: '{key}' already exists — it will be updated.")
+    return key, vars
+
+
 def main():
     if len(sys.argv) < 3:
         fail("usage: install_config.py <repo_root> <server> [server ...]")
@@ -136,15 +188,25 @@ def main():
 
     secret_cache = {}
     changed = []
+    instances = []  # (server_name, config_key, vars) for post-install hints
     for name in servers:
         tmpl_path = os.path.join(repo, "servers", name, "config.json")
         if not os.path.isfile(tmpl_path):
             fail(f"no config.json for server '{name}' at {tmpl_path}")
         with open(tmpl_path) as f:
             tmpl = json.load(f)
-        existing_env = (mcp.get(name) or {}).get("env", {}) if isinstance(mcp.get(name), dict) else {}
-        mcp[name] = expand(tmpl, repo, existing_env, secret_cache)
-        changed.append(name)
+        inst = tmpl.pop("__instance__", None)
+        if inst:
+            print(f"\n  {name}: configuring a new instance")
+            key, vars = prompt_instance(inst, mcp)
+            existing_env = (mcp.get(key) or {}).get("env", {}) if isinstance(mcp.get(key), dict) else {}
+            mcp[key] = expand(tmpl, repo, existing_env, secret_cache, vars)
+            changed.append(key)
+            instances.append((name, key, vars))
+        else:
+            existing_env = (mcp.get(name) or {}).get("env", {}) if isinstance(mcp.get(name), dict) else {}
+            mcp[name] = expand(tmpl, repo, existing_env, secret_cache)
+            changed.append(name)
 
     bak = CFG + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
     if os.path.exists(CFG):
@@ -156,6 +218,9 @@ def main():
     if os.path.exists(bak):
         print(f"  backup: {os.path.basename(bak)}")
     print(f"  servers now in config: {', '.join(sorted(mcp.keys()))}")
+    for name, key, vars in instances:
+        if name == "ms365":
+            print(f"  {key}: authenticate with  ./servers/ms365/login.sh {vars['PREFIX']}")
     print("  Launch Cowork to load the changes.")
 
 

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""
+ms365 auth-cache wrapper (MS365_MCP_AUTH_CACHE_COMMAND, protocol v1).
+
+Why this exists
+---------------
+@softeria/ms-365-mcp-server stores its MSAL token cache + selected-account in the
+OS keychain (via keytar) under a FIXED service/account name. That means every
+`npx` instance of the server shares one credential blob — so you cannot run two
+accounts side by side just by pointing them at different files: keytar wins and
+they clobber each other.
+
+The server supports replacing keytar+file storage entirely with an external
+command (see its "External auth-cache command" docs). This wrapper is that
+command: it bypasses the keychain and stores each instance's credentials in its
+OWN directory, given by env MS365_AUTH_CACHE_DIR (set per instance in Claude's
+config). That is what lets multiple ms365 MCP servers keep fully separate creds.
+
+The server invokes us as:
+    <this> load   token-cache|selected-account     (no stdin)
+    <this> save   token-cache|selected-account     (stdin: {"value":"<envelope>"})
+    <this> delete token-cache|selected-account
+Files are written 0600 inside a 0700 directory.
+"""
+import json
+import os
+import sys
+
+VALID_KEYS = ("token-cache", "selected-account")
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.stderr.write("usage: ms365-auth-cache <load|save|delete> <token-cache|selected-account>\n")
+        return 1
+    op, key = sys.argv[1], sys.argv[2]
+    if key not in VALID_KEYS:
+        sys.stderr.write(f"unknown key: {key}\n")
+        return 1
+
+    base = (os.environ.get("MS365_AUTH_CACHE_DIR") or "").strip()
+    if not base:
+        sys.stderr.write("MS365_AUTH_CACHE_DIR is not set\n")
+        return 1
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    path = os.path.join(base, key + ".json")
+
+    if op == "load":
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                value = f.read()
+            sys.stdout.write(json.dumps({"found": True, "value": value}))
+        else:
+            sys.stdout.write(json.dumps({"found": False}))
+        return 0
+
+    if op == "save":
+        raw = sys.stdin.read()
+        try:
+            value = json.loads(raw)["value"]
+        except Exception as e:  # malformed payload -> storage error (non-zero)
+            sys.stderr.write(f"invalid save payload: {e}\n")
+            return 1
+        if not isinstance(value, str):
+            sys.stderr.write("save payload 'value' must be a string\n")
+            return 1
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value)
+        os.replace(tmp, path)  # durable, atomic
+        return 0
+
+    if op == "delete":
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return 0
+
+    sys.stderr.write(f"unknown operation: {op}\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

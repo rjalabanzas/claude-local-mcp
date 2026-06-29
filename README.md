@@ -52,7 +52,7 @@ run the `.sh` scripts.
 | Server | What | Built how | Per-machine auth |
 |---|---|---|---|
 | `teamwork` | Projects/Desk/Spaces (`tw-mcp`, patched for due-date/overdue) | from **official** upstream + our patch, provenance-verified | paste bearer token |
-| `ms365` | Outlook/Calendar/SharePoint/Teams/etc. | config only (`npx`) | device-code login (keychain) |
+| `ms365` | Outlook/Calendar/SharePoint/Teams/etc. (one entry **per account**) | config only (`npx`) | `./servers/ms365/login.sh <prefix>` (device-code; per-account file) |
 | `readai` | Read.ai meetings/transcripts | vendored (own code) | `uv run servers/readai/auth.py` |
 | `telegram` | Telegram | vendored (chigwell + my patch) | phone login on first run |
 | `outlook` | Outlook (community server, calendar fix) | vendored + `npm build` | OAuth (uses ms365 app) |
@@ -68,10 +68,41 @@ run the `.sh` scripts.
   `install_config.py` merges their entries into Claude's config (backup first,
   prompts for any secrets via hidden input).
 
+### ms365: multiple accounts
+
+`ms365` can be installed **once per Microsoft account** — each becomes its own
+MCP server so Claude can tell them apart and each account's credentials live in
+their own file (not the shared OS keychain).
+
+Run the installer again for each account:
+
+```bash
+./bootstrap.sh ms365      # asks for: a 4-letter prefix (+ optional tenant)
+```
+
+- **prefix** (≤4 letters, e.g. `work`, `prsl`) → the MCP is named `ms365-<prefix>`,
+  so its tools appear as `mcp__ms365-<prefix>__…` — that's how Claude differentiates them.
+- **tenant** → press Enter for `common` (work/school accounts). Use `consumers`
+  for a **personal** Microsoft account — on `common`, personal-account sessions
+  expire ~1 hour after login (refresh tokens are rejected).
+
+Then log in each one (device-code flow):
+
+```bash
+./servers/ms365/login.sh work     # token saved to servers/ms365/.creds/work/
+./servers/ms365/login.sh prsl     # …/.creds/prsl/  — fully separate
+```
+
+Credentials bypass the keychain via a small file-based auth-cache wrapper
+(`ms365-auth-cache`), which is what keeps the accounts isolated. The `.creds/`
+dir is git-ignored.
+
 ### Adding a new MCP later
 
 Drop a new `servers/<name>/` folder with `manifest.sh`, `setup.sh`, and
 `config.json`. No edits to `bootstrap.sh` — it's picked up automatically.
+A server that installs once-per-account (like `ms365`) adds a top-level
+`__instance__` block to its `config.json` — see `install_config.py` for the format.
 
 ## Security
 

@@ -1,8 +1,17 @@
 {
+  "__instance__": {
+    "key": "ms365-${PREFIX}",
+    "prompts": [
+      { "var": "PREFIX", "label": "short tool-name prefix, max 4 letters (e.g. work, prsl) — sets the MCP name ms365-<prefix>", "validate": "prefix" },
+      { "var": "TENANT", "label": "tenant [common] — Enter to keep 'common' (work/school), or type one: 'consumers' (personal MS account) / your tenant ID / your domain", "default": "common" }
+    ]
+  },
   "command": "${BIN:npx}",
   "args": ["-y", "@softeria/ms-365-mcp-server@latest", "--org-mode"],
   "env": {
     "MS365_MCP_CLIENT_ID": "${ASK:MS365_MCP_CLIENT_ID}",
-    "MS365_MCP_TENANT_ID": "${ASK:MS365_MCP_TENANT_ID}"
+    "MS365_MCP_TENANT_ID": "${TENANT}",
+    "MS365_MCP_AUTH_CACHE_COMMAND": "${OSEXE:${REPO}/servers/ms365/ms365-auth-cache}",
+    "MS365_AUTH_CACHE_DIR": "${REPO}/servers/ms365/.creds/${PREFIX}"
   }
 }
