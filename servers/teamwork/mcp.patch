@@ -1,9 +1,1298 @@
-diff --git a/internal/twprojects/file_download.go b/internal/twprojects/file_download.go
+diff --git a/cmd/mcp-stdio/main.go b/cmd/mcp-stdio/main.go
+index 8ae572d..3abd1dd 100644
+--- a/cmd/mcp-stdio/main.go
++++ b/cmd/mcp-stdio/main.go
+@@ -23,9 +23,10 @@ import (
+ )
+ 
+ var (
+-	methods   = cli.NewMethods(toolsets.MethodAll)
+-	readOnly  bool
+-	logToFile string
++	methods     = cli.NewMethods(toolsets.MethodAll)
++	readOnly    bool
++	allowDelete bool
++	logToFile   string
+ )
+ 
+ func main() {
+@@ -34,6 +35,7 @@ func main() {
+ 	flag.Var(methods, "toolsets", "Comma-separated list of toolsets to enable")
+ 	flag.StringVar(&logToFile, "log-to-file", "", "Path to log file (if empty, logs to stderr)")
+ 	flag.BoolVar(&readOnly, "read-only", false, "Restrict the server to read-only operations")
++	flag.BoolVar(&allowDelete, "allow-delete", false, "Enable destructive delete tools (delete_task, delete_comment, delete_notebook, etc.)")
+ 	flag.Parse()
+ 
+ 	f := os.Stderr
+@@ -84,6 +86,12 @@ func main() {
+ 		}
+ 	})
+ 
++	// Fold the type-fix (formerly tw_typefix_proxy.py) into the server so the
++	// bundled .mcpb desktop extension works without an external stdio proxy:
++	// flatten anyOf:[T,null] schemas on tools/list and coerce tools/call
++	// argument types before validation. See typefix.go.
++	mcpServer.AddReceivingMiddleware(newTypeFixer().Middleware())
++
+ 	ss, err := mcpServer.Connect(ctx, &mcp.StdioTransport{}, nil)
+ 	if err != nil {
+ 		mcpError(resources.Logger(), fmt.Errorf("failed to connect: %s", err), jsonRPCErrorCodeInternalError)
+@@ -114,7 +122,7 @@ func main() {
+ }
+ 
+ func newMCPServer(resources config.Resources) (*mcp.Server, error) {
+-	projectsGroup := twprojects.DefaultToolsetGroup(readOnly, false, resources.TeamworkEngine())
++	projectsGroup := twprojects.DefaultToolsetGroup(readOnly, allowDelete, resources.TeamworkEngine())
+ 	if err := projectsGroup.EnableToolsets(methods.Toolsets()...); err != nil {
+ 		return nil, fmt.Errorf("failed to enable projects toolsets: %w", err)
+ 	}
+diff --git a/cmd/mcp-stdio/typefix.go b/cmd/mcp-stdio/typefix.go
 new file mode 100644
-index 0000000..f881a0d
+index 0000000..f798a2d
 --- /dev/null
-+++ b/internal/twprojects/file_download.go
-@@ -0,0 +1,431 @@
++++ b/cmd/mcp-stdio/typefix.go
+@@ -0,0 +1,416 @@
++package main
++
++// typefix.go folds the logic of tw_typefix_proxy.py into the binary itself.
++//
++// Why this exists: the tool schemas advertise optional, typed params as
++// anyOf:[{type:T},{type:null}]. MCP clients (notably Claude Desktop) flatten
++// that to a type-less property, so the model sends the value as a bare string
++// and the SDK's schema validation rejects it
++// (e.g. list_tasks(assignee_user_ids=[12345]) -> `has type "string", want "array"`).
++//
++// The old fix was an external Python stdio proxy wrapping the binary. A bundled
++// .mcpb desktop extension can't carry a Python proxy, so the same two-part fix
++// now lives here as MCP receiving middleware on the stdio server:
++//
++//  1. tools/list  — flatten anyOf:[T,null] -> plain type:T in the *advertised*
++//     schema, so a well-behaved client sends correctly-typed values. We copy
++//     the tools first; the server hands back its live *Tool pointers.
++//  2. tools/call  — coerce incoming argument values to each param's declared
++//     type before the SDK validates them (string "5" -> 5, "[1,2]" -> [1,2],
++//     "true" -> true, etc.).
++//
++// The server's validation schema is a separate *jsonschema.Resolved captured at
++// AddTool time and is never re-read from Tool.InputSchema, so flattening the
++// advertised schema cannot weaken validation, and coerced values still satisfy
++// the original anyOf:[T,null] resolved schema.
++
++import (
++	"context"
++	"encoding/json"
++	"math"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++)
++
++// paramType is the resolved JSON type of a single tool parameter. itemType is
++// only set when typ == "array".
++type paramType struct {
++	typ      string
++	itemType string
++}
++
++// typeFixer learns each tool's parameter types from tools/list responses and
++// uses them to coerce tools/call arguments. Safe for concurrent use.
++type typeFixer struct {
++	mu       sync.RWMutex
++	toolType map[string]map[string]paramType
++}
++
++func newTypeFixer() *typeFixer {
++	return &typeFixer{toolType: make(map[string]map[string]paramType)}
++}
++
++// Name sets mirrored verbatim from tw_typefix_proxy.py so inference matches the
++// proven local behaviour exactly.
++var (
++	numberNames      = map[string]bool{"hours": true}
++	stringArrayNames = map[string]bool{
++		"companynames": true, "emails": true, "domains": true, "tags": true,
++		"deletetags": true, "files": true, "entities": true, "options": true,
++		"predecessors": true,
++	}
++	integerNames = map[string]bool{
++		"id": true, "page": true, "page_size": true, "pagesize": true,
++		"pageoffset": true, "limit": true, "offset": true, "minutes": true,
++		"seconds": true, "days_offset": true, "estimated_minutes": true,
++		"displayorder": true, "progress": true,
++	}
++	boolNames = map[string]bool{
++		"verbose": true, "match_all_tags": true, "billable": true,
++		"include_contents": true, "is_utc": true, "running_timers_only": true,
++		"admin": true, "includedeleted": true, "include_completed_items": true,
++		"include_site_level": true, "only_project_level": true,
++		"only_site_level": true, "show_deleted": true, "isparttime": true,
++		"isprivate": true, "ispublish": true, "isrequiredreading": true,
++		"isfullwidth": true, "isminorchange": true, "notifycustomer": true,
++		"notify_current_user": true, "stop_running_timers": true,
++		"running": true, "enabledforfutureinboxes": true,
++		"readerinlinecommentsenabled": true, "clear_section": true,
++		"new_from_template": true, "to_template": true,
++	}
++)
++
++// inferType guesses a param's type from its name (and JSON-schema default, if
++// any) when the schema carries no explicit type. Mirrors infer_type() in
++// tw_typefix_proxy.py, including the order of the checks. prop may be nil.
++func inferType(name string, prop map[string]any) paramType {
++	if prop != nil {
++		if d, ok := prop["default"]; ok && d != nil {
++			switch v := d.(type) {
++			case bool:
++				return paramType{"boolean", ""}
++			case float64: // all JSON numbers decode to float64
++				if v == math.Trunc(v) {
++					return paramType{"integer", ""}
++				}
++				return paramType{"number", ""}
++			case []any:
++				return paramType{"array", "integer"}
++			case string:
++				return paramType{"string", ""}
++			}
++		}
++	}
++	low := strings.ToLower(name)
++	switch {
++	case strings.HasSuffix(low, "_ids") || strings.HasSuffix(name, "IDs") ||
++		strings.HasSuffix(name, "Ids") || low == "ids":
++		return paramType{"array", "integer"}
++	case stringArrayNames[low]:
++		return paramType{"array", "string"}
++	case numberNames[low]:
++		return paramType{"number", ""}
++	case strings.HasSuffix(low, "_id") || strings.HasSuffix(name, "Id") || integerNames[low]:
++		return paramType{"integer", ""}
++	case boolNames[low] || strings.HasPrefix(low, "is_") || strings.HasPrefix(low, "include_") ||
++		strings.HasPrefix(low, "only_") || strings.HasPrefix(low, "show_") ||
++		strings.HasPrefix(low, "has_"):
++		return paramType{"boolean", ""}
++	}
++	return paramType{"string", ""}
++}
++
++// schemaCopyKeys are the keys lifted from a flattened anyOf/oneOf branch up onto
++// the parent property (matches the proxy's patch_tool).
++var schemaCopyKeys = []string{
++	"type", "items", "enum", "format", "pattern", "properties", "required",
++	"minProperties", "maxProperties", "minimum", "maximum",
++}
++
++// patchSchema flattens anyOf/oneOf:[T,null] -> plain type:T inside a tool's
++// input schema (mutating the map in place) and returns the param->type map used
++// to coerce call arguments. Mirrors patch_tool() in tw_typefix_proxy.py.
++func patchSchema(schema map[string]any) map[string]paramType {
++	tmap := make(map[string]paramType)
++	props, ok := schema["properties"].(map[string]any)
++	if !ok {
++		return tmap
++	}
++	for name, raw := range props {
++		prop, ok := raw.(map[string]any)
++		if !ok {
++			continue
++		}
++
++		// Already has an explicit type — just record it.
++		if t, ok := prop["type"].(string); ok {
++			switch t {
++			case "array":
++				tmap[name] = paramType{"array", itemType(prop)}
++			case "boolean", "integer", "number", "string":
++				tmap[name] = paramType{t, ""}
++			}
++			continue
++		}
++
++		// anyOf / oneOf — flatten the [T, null] union to T.
++		if key := unionKey(prop); key != "" {
++			branches, _ := prop[key].([]any)
++			nonnull := nonNullBranches(branches)
++			switch {
++			case len(nonnull) == 1 && branchType(nonnull[0]) != "":
++				b := nonnull[0]
++				delete(prop, key)
++				for _, k := range schemaCopyKeys {
++					if v, ok := b[k]; ok {
++						prop[k] = v
++					}
++				}
++				if bt, _ := prop["type"].(string); bt == "array" {
++					tmap[name] = paramType{"array", itemType(prop)}
++				} else if bt != "" {
++					tmap[name] = paramType{bt, ""}
++				}
++			default:
++				for _, b := range nonnull {
++					if bt := branchType(b); bt != "" {
++						if bt == "array" {
++							tmap[name] = paramType{"array", itemType(b)}
++						} else {
++							tmap[name] = paramType{bt, ""}
++						}
++						break
++					}
++				}
++			}
++			continue
++		}
++
++		// allOf — leave untouched (proxy does the same).
++		if _, ok := prop["allOf"]; ok {
++			continue
++		}
++
++		// Type-less property — infer from the name and write the type into the
++		// advertised schema so clients send the right shape.
++		pt := inferType(name, prop)
++		if pt.typ == "array" {
++			prop["type"] = "array"
++			if _, ok := prop["items"]; !ok {
++				it := pt.itemType
++				if it == "" {
++					it = "integer"
++				}
++				prop["items"] = map[string]any{"type": it}
++			}
++		} else {
++			prop["type"] = pt.typ
++		}
++		tmap[name] = pt
++	}
++	return tmap
++}
++
++func unionKey(prop map[string]any) string {
++	if _, ok := prop["anyOf"]; ok {
++		return "anyOf"
++	}
++	if _, ok := prop["oneOf"]; ok {
++		return "oneOf"
++	}
++	return ""
++}
++
++func nonNullBranches(branches []any) []map[string]any {
++	var out []map[string]any
++	for _, b := range branches {
++		if bm, ok := b.(map[string]any); ok {
++			if t, _ := bm["type"].(string); t != "null" {
++				out = append(out, bm)
++			}
++		}
++	}
++	return out
++}
++
++func branchType(b map[string]any) string {
++	t, _ := b["type"].(string)
++	return t
++}
++
++func itemType(prop map[string]any) string {
++	if items, ok := prop["items"].(map[string]any); ok {
++		if t, ok := items["type"].(string); ok {
++			return t
++		}
++	}
++	return ""
++}
++
++// coerce converts val to the declared type where it can, leaving it untouched
++// otherwise. Mirrors coerce() in tw_typefix_proxy.py.
++func coerce(val any, typ, item string) any {
++	switch typ {
++	case "boolean":
++		switch v := val.(type) {
++		case bool:
++			return v
++		case string:
++			switch strings.ToLower(strings.TrimSpace(v)) {
++			case "true", "1", "yes":
++				return true
++			case "false", "0", "no":
++				return false
++			}
++		}
++		return val
++	case "integer":
++		switch v := val.(type) {
++		case bool:
++			return v // don't turn bools into ints
++		case float64:
++			if v == math.Trunc(v) {
++				return int64(v)
++			}
++			return val
++		case string:
++			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
++				return n
++			}
++		}
++		return val
++	case "number":
++		switch v := val.(type) {
++		case float64:
++			return v
++		case string:
++			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
++				return f
++			}
++		}
++		return val
++	case "array":
++		switch v := val.(type) {
++		case []any:
++			if item != "" {
++				out := make([]any, len(v))
++				for i, x := range v {
++					out[i] = coerce(x, item, "")
++				}
++				return out
++			}
++			return v
++		case string:
++			s := strings.TrimSpace(v)
++			if strings.HasPrefix(s, "[") {
++				var arr []any
++				if json.Unmarshal([]byte(s), &arr) == nil {
++					out := make([]any, len(arr))
++					for i, x := range arr {
++						out[i] = coerce(x, item, "")
++					}
++					return out
++				}
++			}
++			out := []any{}
++			for _, p := range strings.Split(s, ",") {
++				if p = strings.TrimSpace(p); p != "" {
++					out = append(out, coerce(p, item, ""))
++				}
++			}
++			return out
++		}
++		return val
++	}
++	return val
++}
++
++// Middleware returns receiving middleware that coerces tools/call arguments and
++// flattens tools/list schemas.
++func (tf *typeFixer) Middleware() mcp.Middleware {
++	return func(next mcp.MethodHandler) mcp.MethodHandler {
++		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
++			if method == "tools/call" {
++				tf.coerceCall(req)
++			}
++			res, err := next(ctx, method, req)
++			if err == nil && method == "tools/list" {
++				res = tf.flattenList(res)
++			}
++			return res, err
++		}
++	}
++}
++
++// coerceCall rewrites the raw arguments of a tools/call request so each value
++// matches its parameter's declared type.
++func (tf *typeFixer) coerceCall(req mcp.Request) {
++	ctr, ok := req.(*mcp.CallToolRequest)
++	if !ok || ctr.Params == nil || len(ctr.Params.Arguments) == 0 {
++		return
++	}
++	tf.mu.RLock()
++	tmap := tf.toolType[ctr.Params.Name]
++	tf.mu.RUnlock()
++
++	var args map[string]any
++	if err := json.Unmarshal(ctr.Params.Arguments, &args); err != nil {
++		return
++	}
++	for k, v := range args {
++		pt, known := tmap[k]
++		if !known {
++			// Tool never listed this session (e.g. a client that cached the
++			// list): fall back to name-based inference. When the tool *is*
++			// known but the key isn't a declared param, leave it alone.
++			if tmap != nil {
++				continue
++			}
++			pt = inferType(k, nil)
++		}
++		args[k] = coerce(v, pt.typ, pt.itemType)
++	}
++	if raw, err := json.Marshal(args); err == nil {
++		ctr.Params.Arguments = raw
++	}
++}
++
++// flattenList returns a copy of a tools/list result with each tool's input
++// schema flattened, and records the per-tool type maps for coercion. The server
++// hands back its live *Tool pointers, so we never mutate them in place.
++func (tf *typeFixer) flattenList(res mcp.Result) mcp.Result {
++	ltr, ok := res.(*mcp.ListToolsResult)
++	if !ok {
++		return res
++	}
++	out := *ltr
++	out.Tools = make([]*mcp.Tool, len(ltr.Tools))
++	learned := make(map[string]map[string]paramType, len(ltr.Tools))
++
++	for i, tool := range ltr.Tools {
++		if tool == nil {
++			continue
++		}
++		tc := *tool // shallow copy; only InputSchema is replaced
++		if tool.InputSchema != nil {
++			if raw, err := json.Marshal(tool.InputSchema); err == nil {
++				var schema map[string]any
++				if json.Unmarshal(raw, &schema) == nil {
++					learned[tool.Name] = patchSchema(schema)
++					tc.InputSchema = schema
++				}
++			}
++		}
++		out.Tools[i] = &tc
++	}
++
++	tf.mu.Lock()
++	for name, m := range learned {
++		tf.toolType[name] = m
++	}
++	tf.mu.Unlock()
++	return &out
++}
+diff --git a/go.mod b/go.mod
+index 7cceacc..8667af7 100644
+--- a/go.mod
++++ b/go.mod
+@@ -96,3 +96,5 @@ require (
+ 	gopkg.in/ini.v1 v1.67.1 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ )
++
++replace github.com/teamwork/twapi-go-sdk => ../twapi-go-sdk
+diff --git a/go.sum b/go.sum
+index cbdad37..2293abc 100644
+--- a/go.sum
++++ b/go.sum
+@@ -184,8 +184,6 @@ github.com/teamwork/desksdkgo v1.0.1 h1:Mi5D1pnGfL5JwD7s7g7OyHml7Y9jsak5MNJaotJt
+ github.com/teamwork/desksdkgo v1.0.1/go.mod h1:Mgvw83q8iqHr7Sm9xV1iI/T89o3ObaPU3ChMJheRzwA=
+ github.com/teamwork/spacessdkgo v0.0.0-20260518181558-a6af69d00abb h1:bQluDjySZeC5etnWgjk4WFRy0PvzGDw8XEBd4JJYWCQ=
+ github.com/teamwork/spacessdkgo v0.0.0-20260518181558-a6af69d00abb/go.mod h1:jfE0RLsZuk/3Glzs5bJ95pNb92emV7uXZYgoGSLQ76I=
+-github.com/teamwork/twapi-go-sdk v1.19.4 h1:s7+gzMWrwprOxamv/I/mJug02sdPioSq7RWUM6QLoKk=
+-github.com/teamwork/twapi-go-sdk v1.19.4/go.mod h1:Z0R6uOeso0BH1tKdHVbT5TOqVGPMwPLuTPsHSyl4G/8=
+ github.com/tinylib/msgp v1.6.3 h1:bCSxiTz386UTgyT1i0MSCvdbWjVW+8sG3PjkGsZQt4s=
+ github.com/tinylib/msgp v1.6.3/go.mod h1:RSp0LW9oSxFut3KzESt5Voq4GVWyS+PSulT77roAqEA=
+ github.com/tklauser/go-sysconf v0.3.16 h1:frioLaCQSsF5Cy1jgRBrzr6t502KIIwQ0MArYICU0nA=
+diff --git a/internal/twdesk/file_download.go b/internal/twdesk/file_download.go
+new file mode 100644
+index 0000000..2a0111d
+--- /dev/null
++++ b/internal/twdesk/file_download.go
+@@ -0,0 +1,139 @@
++package twdesk
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/config"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++)
++
++// List of methods available in the Teamwork.com MCP service.
++const (
++	MethodFileDownload toolsets.Method = "twdesk-download_file"
++)
++
++// deskFileGetResponse models the subset of the Teamwork Desk
++// GET /files/{id}.json response that we need. The desksdkgo File model does not
++// expose downloadURL/size, so we parse the raw body ourselves rather than going
++// through client.Files.Get (which decodes into the typed struct and drops those
++// fields). Same reason the Projects download_file tool reads the raw body.
++type deskFileGetResponse struct {
++	File struct {
++		ID          int    `json:"id"`
++		Filename    string `json:"filename"`
++		MIMEType    string `json:"mimeType"`
++		Size        int64  `json:"size"`
++		DownloadURL string `json:"downloadURL"`
++	} `json:"file"`
++}
++
++// FileDownload retrieves a Teamwork Desk file/attachment by its ID and returns
++// its pre-signed download URL plus metadata. The download URL is short-lived and
++// pre-authenticated, so it can be fetched directly to read the file contents
++// (e.g. a PDF attached to a ticket) without a Teamwork token.
++func FileDownload(httpClient *http.Client) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodFileDownload),
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "Download File",
++				ReadOnlyHint: true,
++			},
++			Description: "Retrieve a Desk file/attachment by its file ID and return a pre-signed download URL " +
++				"plus metadata (filename, MIME type, size). The URL is pre-authenticated and can be fetched " +
++				"directly to read the file's contents. File IDs come from a ticket's files list.",
++			InputSchema: &jsonschema.Schema{
++				Type:                 "object",
++				AdditionalProperties: falseSchema(),
++				Properties: map[string]*jsonschema.Schema{
++					"fileID": {
++						Type:        "integer",
++						Description: "The ID of the Desk file/attachment to retrieve (as listed in a ticket's files).",
++					},
++				},
++				Required: []string{"fileID"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			arguments, err := helpers.NewToolArguments(request)
++			if err != nil {
++				return helpers.NewToolResultTextError("%v", err), nil
++			}
++
++			fileID, err := arguments.RequireInt("fileID")
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			if fileID <= 0 {
++				return helpers.NewToolResultTextError("fileID must be a positive integer"), nil
++			}
++
++			// Derive the base URL and bearer token the same way ClientFromContext
++			// does, so this raw request authenticates identically to the SDK client.
++			baseURL := "https://api.teamwork.com/desk/api/v2"
++			if customerURL, ok := config.CustomerURLFromContext(ctx); ok {
++				customerURL = strings.TrimSuffix(customerURL, "/")
++				baseURL = customerURL + "/desk/api/v2"
++			}
++
++			uri := fmt.Sprintf("%s/files/%d.json", baseURL, fileID)
++			req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to build request: %s", err.Error()), nil
++			}
++			if bearerToken, ok := config.BearerTokenFromContext(ctx); ok {
++				req.Header.Set("Authorization", "Bearer "+bearerToken)
++			}
++			req.Header.Set("Accept", "application/json")
++
++			client := httpClient
++			if client == nil {
++				client = http.DefaultClient
++			}
++			resp, err := client.Do(req)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to fetch file %d: %s", fileID, err.Error()), nil
++			}
++			defer func() { _ = resp.Body.Close() }()
++
++			body, err := io.ReadAll(resp.Body)
++			if err != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", err)
++			}
++			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++				return helpers.NewToolResultTextError(
++					"failed to fetch file %d: status %d (body: %s)",
++					fileID, resp.StatusCode, strings.TrimSpace(string(body)),
++				), nil
++			}
++
++			var parsed deskFileGetResponse
++			if err := json.Unmarshal(body, &parsed); err != nil {
++				return helpers.NewToolResultTextError(
++					"failed to parse file response: %s (body: %s)", err.Error(), strings.TrimSpace(string(body)),
++				), nil
++			}
++			if parsed.File.DownloadURL == "" {
++				return helpers.NewToolResultTextError(
++					"file %d has no download URL (body: %s)", fileID, strings.TrimSpace(string(body)),
++				), nil
++			}
++
++			return helpers.NewToolResultJSON(map[string]any{
++				"id":          parsed.File.ID,
++				"filename":    parsed.File.Filename,
++				"mimeType":    parsed.File.MIMEType,
++				"size":        parsed.File.Size,
++				"downloadURL": parsed.File.DownloadURL,
++			})
++		},
++	}
++}
+diff --git a/internal/twdesk/tools.go b/internal/twdesk/tools.go
+index 7f63d40..bdbb2ec 100644
+--- a/internal/twdesk/tools.go
++++ b/internal/twdesk/tools.go
+@@ -46,6 +46,7 @@ func DefaultToolsetGroup(readOnly bool, httpClient *http.Client) *toolsets.Tools
+ 			TicketUpdate(httpClient),
+ 		).
+ 		AddReadTools(
++			FileDownload(httpClient),
+ 			InboxGet(httpClient),
+ 			InboxList(httpClient),
+ 			TicketGet(httpClient),
+diff --git a/internal/twprojects/cloudstorage.go b/internal/twprojects/cloudstorage.go
+new file mode 100644
+index 0000000..5aee6f2
+--- /dev/null
++++ b/internal/twprojects/cloudstorage.go
+@@ -0,0 +1,633 @@
++package twprojects
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// Cloud-storage (SharePoint/OneDrive/Google Drive) integration tools.
++//
++// Teamwork brokers all of this through the Teamwork bearer token:
++//   - browse:  GET  /cloudstorage/folders.json    (list a connected folder)
++//   - upload:  GET  /cloudstorage/token.json  ->  Microsoft Graph PUT .../content
++//   - link:    PUT  /cloudstorage/files/link.json  (register the file in the project)
++//
++// The upload is the only leg that leaves Teamwork: token.json returns a
++// short-lived Microsoft Graph access token + driveId, and the file bytes are
++// PUT straight to graph.microsoft.com. Everything else is standard Teamwork v1.
++const (
++	MethodCloudStorageBrowse toolsets.Method = "twprojects-browse_cloud_storage"
++	MethodCloudStorageUpload toolsets.Method = "twprojects-upload_to_cloud_storage"
++	MethodCloudFileLink      toolsets.Method = "twprojects-link_cloud_file"
++)
++
++// ---------------------------------------------------------------------------
++// browse_cloud_storage
++// ---------------------------------------------------------------------------
++
++type cloudFoldersRequest struct {
++	ProjectID int64
++	Provider  string
++	FolderID  string // empty => connected root
++}
++
++func (r cloudFoldersRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	q := url.Values{}
++	q.Set("projectId", fmt.Sprintf("%d", r.ProjectID))
++	q.Set("provider", r.Provider)
++	q.Set("mode", "uploadFiles")
++	q.Set("page", "1")
++	q.Set("pageSize", "25000")
++	q.Set("refresh", "true")
++	if r.FolderID != "" {
++		q.Set("folder", r.FolderID)
++		q.Set("folderid", r.FolderID)
++	}
++	uri := fmt.Sprintf("%s/cloudstorage/folders.json?%s", server, q.Encode())
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++type rawFolderEntry struct {
++	ID       string      `json:"id"`
++	FileName string      `json:"fileName"`
++	IsDir    bool        `json:"isDir"`
++	Size     json.Number `json:"size"`
++	Path     string      `json:"path"`
++	Type     string      `json:"type"`
++	Modified string      `json:"modified"`
++}
++
++type rawFoldersResponse struct {
++	Status string `json:"STATUS"`
++	Folder struct {
++		Name     string           `json:"name"`
++		Contents []rawFolderEntry `json:"contents"`
++	} `json:"folder"`
++	FolderID          string `json:"folderId"`
++	ParentFolderID    string `json:"parentFolderId"`
++	CanBrowseUpFolder bool   `json:"canBrowseUpAFolder"`
++}
++
++// BrowseCloudStorage lists the files and subfolders of a connected cloud-storage
++// (SharePoint/OneDrive/Google Drive) folder on a project, returning each entry's
++// id, name, whether it is a folder, size and drive path. The ids and path are
++// exactly what link_cloud_file needs; a subfolder's id is passed back as
++// folder_id to drill in.
++func BrowseCloudStorage(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodCloudStorageBrowse),
++			Description: "List the files and subfolders of a connected cloud-storage folder (SharePoint, " +
++				"OneDrive or Google Drive) on a project. Returns each entry's id, name, is_folder, size and " +
++				"drive path. Omit folder_id to list the project's connected root; pass a subfolder's id (from " +
++				"a previous call) as folder_id to drill into it. Use the returned file id/name/path/size with " +
++				"link_cloud_file to link a file to a task.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "Browse Cloud Storage",
++				ReadOnlyHint: true,
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"project_id": {
++						Type:        "integer",
++						Description: "The project whose connected cloud storage to browse.",
++					},
++					"folder_id": {
++						Description: "Optional folder id to list. Omit to list the connected root folder.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++					"provider": {
++						Description: "Cloud provider: sharepoint (default), onedrivebusiness, onedrive or googledrive.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++				},
++				Required: []string{"project_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++			var projectID int64
++			var folderID, provider string
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++				helpers.OptionalParam(&folderID, "folder_id"),
++				helpers.OptionalParam(&provider, "provider"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			if provider == "" {
++				provider = "sharepoint"
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, cloudFoldersRequest{
++				ProjectID: projectID, Provider: provider, FolderID: folderID,
++			})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to browse cloud storage")
++			}
++			body, _ := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to browse cloud storage"), "failed to browse cloud storage")
++			}
++			var decoded rawFoldersResponse
++			if err := json.Unmarshal(body, &decoded); err != nil {
++				return helpers.NewToolResultTextError("failed to parse folder listing: %s", err.Error()), nil
++			}
++
++			type entry struct {
++				ID       string `json:"id"`
++				Name     string `json:"name"`
++				IsFolder bool   `json:"is_folder"`
++				Size     string `json:"size"`
++				Path     string `json:"path"`
++				Modified string `json:"modified,omitempty"`
++			}
++			out := struct {
++				ProjectID         int64   `json:"project_id"`
++				Provider          string  `json:"provider"`
++				FolderID          string  `json:"folder_id"`
++				ParentFolderID    string  `json:"parent_folder_id"`
++				CanBrowseUpFolder bool    `json:"can_browse_up_a_folder"`
++				Returned          int     `json:"returned"`
++				Entries           []entry `json:"entries"`
++			}{
++				ProjectID: projectID, Provider: provider,
++				FolderID: decoded.FolderID, ParentFolderID: decoded.ParentFolderID,
++				CanBrowseUpFolder: decoded.CanBrowseUpFolder,
++			}
++			for _, c := range decoded.Folder.Contents {
++				out.Entries = append(out.Entries, entry{
++					ID: c.ID, Name: c.FileName, IsFolder: c.IsDir,
++					Size: c.Size.String(), Path: c.Path, Modified: c.Modified,
++				})
++			}
++			out.Returned = len(out.Entries)
++			return helpers.NewToolResultJSON(out)
++		},
++	}
++}
++
++// ---------------------------------------------------------------------------
++// upload_to_cloud_storage
++// ---------------------------------------------------------------------------
++
++type cloudTokenRequest struct {
++	ProjectID int64
++	Provider  string
++}
++
++func (r cloudTokenRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	q := url.Values{}
++	q.Set("projectId", fmt.Sprintf("%d", r.ProjectID))
++	q.Set("provider", r.Provider)
++	uri := fmt.Sprintf("%s/cloudstorage/token.json?%s", server, q.Encode())
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// UploadToCloudStorage uploads a local file into a connected cloud-storage folder
++// (via a Teamwork-brokered Microsoft Graph token) and returns the new file's
++// descriptor (id, name, path, size) ready to pass to link_cloud_file.
++func UploadToCloudStorage(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodCloudStorageUpload),
++			Description: "Upload a local file into a connected cloud-storage folder (SharePoint/OneDrive) and " +
++				"return the new file's id, name, drive path and size. Provide the absolute local file_path, the " +
++				"project_id, and the target folder_id (from browse_cloud_storage, e.g. the current month's " +
++				"folder). Optionally set file_name to rename on upload. This does NOT attach the file to a task " +
++				"or add it to the project's Files area - pass the returned descriptor to link_cloud_file for " +
++				"that. Only supports files up to 4MB.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Upload to Cloud Storage",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"project_id": {Type: "integer", Description: "The project whose connected cloud storage to upload into."},
++					"folder_id":  {Type: "string", Description: "Target folder id (from browse_cloud_storage) to upload the file into."},
++					"file_path":  {Type: "string", Description: "Absolute path to the local file to upload."},
++					"file_name": {
++						Description: "Optional name to store the file as (rename on upload). Defaults to the file_path base name.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++					"provider": {
++						Description: "Cloud provider: sharepoint (default), onedrivebusiness or onedrive.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++				},
++				Required: []string{"project_id", "folder_id", "file_path"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++			var projectID int64
++			var folderID, filePath, fileName, provider string
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++				helpers.RequiredParam(&folderID, "folder_id"),
++				helpers.RequiredParam(&filePath, "file_path"),
++				helpers.OptionalParam(&fileName, "file_name"),
++				helpers.OptionalParam(&provider, "provider"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			if provider == "" {
++				provider = "sharepoint"
++			}
++			data, err := os.ReadFile(filePath)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to read file %q: %s", filePath, err.Error()), nil
++			}
++			if len(data) > 4*1024*1024 {
++				return helpers.NewToolResultTextError(
++					"file is %d bytes; this tool only supports uploads up to 4MB", len(data)), nil
++			}
++			if fileName == "" {
++				fileName = filepath.Base(filePath)
++			}
++
++			// Step 1: broker a Microsoft Graph token + driveId via Teamwork.
++			tokResp, err := twapi.ExecuteRaw(ctx, engine, cloudTokenRequest{ProjectID: projectID, Provider: provider})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to get cloud-storage upload token")
++			}
++			tokBody, _ := io.ReadAll(tokResp.Body)
++			_ = tokResp.Body.Close()
++			if tokResp.StatusCode < 200 || tokResp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(tokResp, "failed to get cloud-storage upload token"),
++					"failed to get cloud-storage upload token")
++			}
++			var tok struct {
++				Token   string `json:"token"`
++				DriveID string `json:"driveId"`
++				Status  string `json:"status"`
++			}
++			if err := json.Unmarshal(tokBody, &tok); err != nil || tok.Token == "" || tok.DriveID == "" {
++				return helpers.NewToolResultTextError("cloud-storage token response missing token/driveId"), nil
++			}
++
++			// Step 2: PUT the bytes straight to Microsoft Graph.
++			graphURL := fmt.Sprintf(
++				"https://graph.microsoft.com/v1.0/drives/%s/items/%s:/%s:/content",
++				tok.DriveID, folderID, url.PathEscape(fileName),
++			)
++			gReq, err := http.NewRequestWithContext(ctx, http.MethodPut, graphURL, bytes.NewReader(data))
++			if err != nil {
++				return nil, fmt.Errorf("failed to build graph upload request: %w", err)
++			}
++			gReq.Header.Set("Authorization", "Bearer "+tok.Token)
++			gReq.Header.Set("Content-Type", "application/octet-stream")
++			gResp, err := http.DefaultClient.Do(gReq)
++			if err != nil {
++				return helpers.NewToolResultTextError("graph upload failed: %s", err.Error()), nil
++			}
++			gBody, _ := io.ReadAll(gResp.Body)
++			_ = gResp.Body.Close()
++			if gResp.StatusCode < 200 || gResp.StatusCode >= 300 {
++				return helpers.NewToolResultTextError(
++					"graph upload returned status %d: %s", gResp.StatusCode, strings.TrimSpace(string(gBody))), nil
++			}
++			var item struct {
++				ID              string      `json:"id"`
++				Name            string      `json:"name"`
++				Size            json.Number `json:"size"`
++				WebURL          string      `json:"webUrl"`
++				ParentReference struct {
++					DriveID string `json:"driveId"`
++					Path    string `json:"path"`
++				} `json:"parentReference"`
++			}
++			if err := json.Unmarshal(gBody, &item); err != nil || item.ID == "" {
++				return helpers.NewToolResultTextError("failed to parse graph upload response: %s", strings.TrimSpace(string(gBody))), nil
++			}
++
++			// Normalise the containing-folder path to the /drives/{driveId}/root:… form
++			// that link_cloud_file expects.
++			path := item.ParentReference.Path
++			if !strings.HasPrefix(path, "/drives/") {
++				sub := path
++				if i := strings.Index(sub, "root:"); i >= 0 {
++					sub = sub[i+len("root:"):]
++				}
++				path = fmt.Sprintf("/drives/%s/root:%s", tok.DriveID, sub)
++			}
++
++			out := struct {
++				ID       string `json:"id"`
++				Name     string `json:"name"`
++				Path     string `json:"path"`
++				Size     string `json:"size"`
++				Type     string `json:"type"`
++				WebURL   string `json:"web_url,omitempty"`
++				Provider string `json:"provider"`
++				Message  string `json:"message"`
++			}{
++				ID: item.ID, Name: item.Name, Path: path, Size: item.Size.String(),
++				Type: "file", WebURL: item.WebURL, Provider: provider,
++				Message: fmt.Sprintf("Uploaded %q to %s. Pass id/name/path/size to link_cloud_file to link it to a task.", item.Name, provider),
++			}
++			return helpers.NewToolResultJSON(out)
++		},
++	}
++}
++
++// ---------------------------------------------------------------------------
++// link_cloud_file
++// ---------------------------------------------------------------------------
++
++type cloudLinkFile struct {
++	ID   string `json:"id"`
++	Name string `json:"name"`
++	Path string `json:"path"`
++	Size string `json:"size"`
++	Type string `json:"type"`
++}
++
++type cloudLinkRequest struct {
++	ProjectID       int64
++	CategoryID      int64
++	NewCategoryName string
++	AccessRights    string
++	Provider        string
++	Files           []cloudLinkFile
++}
++
++func (r cloudLinkRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{
++		"projectId":       r.ProjectID,
++		"categoryId":      r.CategoryID,
++		"newCategoryName": r.NewCategoryName,
++		"accessRights":    r.AccessRights,
++		"grantAccessTo":   "",
++		"provider":        r.Provider,
++		"files":           r.Files,
++	}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode link request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/cloudstorage/files/link.json?provider=%s", server, url.QueryEscape(r.Provider))
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// taskAttachmentsSetRequest sets the directly-attached file IDs on a task via
++// the v1 task update endpoint. The v1 "attachments" field takes the full
++// comma-separated set of existing file IDs (it replaces, not appends), so the
++// caller reads the task's current attachments first and passes the union.
++type taskAttachmentsSetRequest struct {
++	TaskID        int64
++	AttachmentIDs string // comma-separated existing file IDs
++}
++
++func (r taskAttachmentsSetRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{"todo-item": map[string]any{"attachments": r.AttachmentIDs}}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode task attach request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/tasks/%d.json", server, r.TaskID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// LinkCloudFile registers a cloud-storage file (already in SharePoint/OneDrive)
++// into a project's Files area and, when task_id is given, attaches it to that
++// task. access_rights defaults to NONE (Teamwork does not create a sharing link;
++// access relies on the file's own SharePoint permissions) which avoids the
++// external-sharing restriction that a "view"/"edit" grant triggers.
++func LinkCloudFile(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodCloudFileLink),
++			Description: "Link a cloud-storage file that already exists in SharePoint/OneDrive into a project's " +
++				"Files area, and optionally attach it to a task. Provide project_id and the file's id, name, " +
++				"path and size (from browse_cloud_storage or upload_to_cloud_storage). When task_id is given, " +
++				"the file is also attached to that task (appended to its existing attachments). access_rights " +
++				"defaults to NONE - Teamwork won't create a sharing link, so access follows the file's own " +
++				"SharePoint permissions; this avoids the \"external sharing restricted\" error that view/edit " +
++				"grants can trigger.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Link Cloud File",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"project_id": {Type: "integer", Description: "The project to link the file into."},
++					"file_id":    {Type: "string", Description: "The cloud-storage file id (driveItem id)."},
++					"file_name":  {Type: "string", Description: "The file's name (e.g. \"PO12345 - Vendor.pdf\")."},
++					"file_path":  {Type: "string", Description: "The file's containing-folder drive path, e.g. /drives/{driveId}/root:/General/Invoices/2026/07. July"},
++					"file_size":  {Type: "string", Description: "The file size in bytes, as a string."},
++					"task_id": {
++						Description: "Optional task to attach the linked file to. Omit to only add it to the project Files area.",
++						AnyOf:       []*jsonschema.Schema{{Type: "integer"}, {Type: "null"}},
++					},
++					"category_id": {
++						Description: "Optional Files-area category id to file it under (default 0 = No Category).",
++						AnyOf:       []*jsonschema.Schema{{Type: "integer"}, {Type: "null"}},
++					},
++					"new_category_name": {
++						Description: "Optional category name (default \"No Category\").",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++					"access_rights": {
++						Description: "Sharing access Teamwork grants: NONE (default, recommended), view or edit. Use NONE unless you specifically need Teamwork to grant project members access via a sharing link.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++					"provider": {
++						Description: "Cloud provider: sharepoint (default), onedrivebusiness, onedrive or googledrive.",
++						AnyOf:       []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++				},
++				Required: []string{"project_id", "file_id", "file_name", "file_path", "file_size"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++			var projectID, taskID, categoryID int64
++			var fileID, fileName, filePath, fileSize, newCategoryName, accessRights, provider string
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++				helpers.RequiredParam(&fileID, "file_id"),
++				helpers.RequiredParam(&fileName, "file_name"),
++				helpers.RequiredParam(&filePath, "file_path"),
++				helpers.RequiredParam(&fileSize, "file_size"),
++				helpers.OptionalNumericParam(&taskID, "task_id"),
++				helpers.OptionalNumericParam(&categoryID, "category_id"),
++				helpers.OptionalParam(&newCategoryName, "new_category_name"),
++				helpers.OptionalParam(&accessRights, "access_rights"),
++				helpers.OptionalParam(&provider, "provider"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			if provider == "" {
++				provider = "sharepoint"
++			}
++			if accessRights == "" {
++				accessRights = "NONE"
++			}
++			if newCategoryName == "" {
++				newCategoryName = "No Category"
++			}
++
++			// Step 1: register the file in the project's Files area.
++			linkResp, err := twapi.ExecuteRaw(ctx, engine, cloudLinkRequest{
++				ProjectID: projectID, CategoryID: categoryID, NewCategoryName: newCategoryName,
++				AccessRights: accessRights, Provider: provider,
++				Files: []cloudLinkFile{{ID: fileID, Name: fileName, Path: filePath, Size: fileSize, Type: "file"}},
++			})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to link cloud file")
++			}
++			linkBody, _ := io.ReadAll(linkResp.Body)
++			_ = linkResp.Body.Close()
++			if linkResp.StatusCode < 200 || linkResp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(linkResp, "failed to link cloud file"), "failed to link cloud file")
++			}
++			var link struct {
++				Status        string `json:"STATUS"`
++				Message       string `json:"MESSAGE"`
++				SelectedFiles []struct {
++					ID   string `json:"id"`
++					Name string `json:"name"`
++				} `json:"selectedFiles"`
++			}
++			_ = json.Unmarshal(linkBody, &link)
++			if link.Status != "" && !strings.EqualFold(link.Status, "OK") {
++				msg := link.Message
++				if msg == "" {
++					msg = strings.TrimSpace(string(linkBody))
++				}
++				return helpers.NewToolResultTextError("failed to link cloud file: %s", msg), nil
++			}
++			if len(link.SelectedFiles) == 0 || link.SelectedFiles[0].ID == "" {
++				return helpers.NewToolResultTextError(
++					"link succeeded but no Teamwork file id was returned (body: %s)", strings.TrimSpace(string(linkBody))), nil
++			}
++			twFileID := link.SelectedFiles[0].ID
++
++			out := struct {
++				TeamworkFileID string `json:"teamwork_file_id"`
++				Name           string `json:"name"`
++				ProjectID      int64  `json:"project_id"`
++				TaskID         int64  `json:"task_id,omitempty"`
++				AttachedToTask bool   `json:"attached_to_task"`
++				Message        string `json:"message"`
++			}{TeamworkFileID: twFileID, Name: fileName, ProjectID: projectID}
++
++			if taskID == 0 {
++				out.Message = fmt.Sprintf("Linked %q into project %d Files (Teamwork file id %s).", fileName, projectID, twFileID)
++				return helpers.NewToolResultJSON(out)
++			}
++
++			// Step 2: attach to the task, preserving its existing attachments.
++			existing, err := taskAttachmentIDs(ctx, engine, taskID)
++			if err != nil {
++				return helpers.NewToolResultTextError(
++					"file linked (Teamwork id %s) but reading task %d's current attachments failed: %s",
++					twFileID, taskID, err.Error()), nil
++			}
++			ids := unionIDs(existing, twFileID)
++			attResp, err := twapi.ExecuteRaw(ctx, engine, taskAttachmentsSetRequest{
++				TaskID: taskID, AttachmentIDs: strings.Join(ids, ","),
++			})
++			if err != nil {
++				return helpers.NewToolResultTextError(
++					"file linked (Teamwork id %s) but attaching to task %d failed: %s", twFileID, taskID, err.Error()), nil
++			}
++			attBody, _ := io.ReadAll(attResp.Body)
++			_ = attResp.Body.Close()
++			if attResp.StatusCode < 200 || attResp.StatusCode >= 300 {
++				return helpers.NewToolResultTextError(
++					"file linked (Teamwork id %s) but attaching to task %d returned status %d: %s",
++					twFileID, taskID, attResp.StatusCode, strings.TrimSpace(string(attBody))), nil
++			}
++			out.TaskID = taskID
++			out.AttachedToTask = true
++			out.Message = fmt.Sprintf("Linked %q into project %d and attached it to task %d (Teamwork file id %s).",
++				fileName, projectID, taskID, twFileID)
++			return helpers.NewToolResultJSON(out)
++		},
++	}
++}
++
++// taskAttachmentIDs reads a task's currently attached file IDs.
++func taskAttachmentIDs(ctx context.Context, engine *twapi.Engine, taskID int64) ([]string, error) {
++	resp, err := twapi.ExecuteRaw(ctx, engine, taskFilesRequest{TaskID: taskID})
++	if err != nil {
++		return nil, err
++	}
++	body, _ := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return nil, fmt.Errorf("status %d", resp.StatusCode)
++	}
++	var decoded rawTaskFilesResponse
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		return nil, err
++	}
++	raw := decoded.Project.Files
++	if len(raw) == 0 {
++		raw = decoded.Files
++	}
++	var ids []string
++	for _, f := range raw {
++		if s := f.ID.String(); s != "" && s != "0" {
++			ids = append(ids, s)
++		}
++	}
++	return ids, nil
++}
++
++// unionIDs returns the existing IDs plus newID, de-duplicated and sorted for
++// deterministic output.
++func unionIDs(existing []string, newID string) []string {
++	set := map[string]struct{}{}
++	for _, id := range existing {
++		set[id] = struct{}{}
++	}
++	set[newID] = struct{}{}
++	out := make([]string, 0, len(set))
++	for id := range set {
++		out = append(out, id)
++	}
++	sort.Strings(out)
++	return out
++}
+diff --git a/internal/twprojects/file_delete.go b/internal/twprojects/file_delete.go
+new file mode 100644
+index 0000000..0de5389
+--- /dev/null
++++ b/internal/twprojects/file_delete.go
+@@ -0,0 +1,116 @@
 +package twprojects
 +
 +import (
@@ -11,6 +1300,129 @@ index 0000000..f881a0d
 +	"encoding/json"
 +	"fmt"
 +	"io"
++	"net/http"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// List of methods available in the Teamwork.com MCP service.
++const (
++	MethodFileDelete toolsets.Method = "twprojects-delete_file"
++)
++
++// fileDeleteRequest is a local HTTP requester for the v1 delete-file endpoint.
++// The SDK models no file delete, so the requester lives here (no twapi-go-sdk
++// edit). It targets a file by its exact ID only — no name matching and no
++// file-version resolution — because the delete is irreversible and must never
++// act on a file other than the one whose ID the caller supplied.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/delete-files-id-json
++type fileDeleteRequest struct {
++	FileID int64
++}
++
++// HTTPRequest builds the DELETE request for a single file.
++func (r fileDeleteRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/files/%d.json", server, r.FileID)
++	return http.NewRequestWithContext(ctx, http.MethodDelete, uri, nil)
++}
++
++// DeleteFile permanently deletes a Teamwork file by its exact ID.
++func DeleteFile(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodFileDelete),
++			Description: "Delete a Teamwork file by its exact ID. This is DESTRUCTIVE and should be " +
++				"treated as IRREVERSIBLE: the file (and all of its versions) is marked deleted and " +
++				"removed from the project and all normal views, and there is no undo through this " +
++				"tool or the API. The caller must pass the exact file_id; the tool performs no name " +
++				"matching and no ID resolution, so it will never delete a file other than the one " +
++				"whose ID was given. A file-version ID is not a file ID and will not resolve here — " +
++				"pass the file's own ID.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:           "Delete File",
++				DestructiveHint: new(true),
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"file_id": {
++						Type:        "integer",
++						Description: "The exact Teamwork file ID to permanently delete.",
++					},
++				},
++				Required: []string{"file_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var fileID int64
++			err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&fileID, "file_id"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, fileDeleteRequest{FileID: fileID})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to delete file")
++			}
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to delete file"),
++					"failed to delete file",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			// The v1 endpoint returns 200 with {"STATUS":"OK"} on success, but can
++			// also return 200 with {"STATUS":"Error"} for some failures — treat a
++			// non-OK STATUS as a failure so a bad delete is never reported as success.
++			var status struct {
++				Status  string `json:"STATUS"`
++				Message string `json:"MESSAGE"`
++			}
++			_ = json.Unmarshal(body, &status)
++			if status.Status != "" && !strings.EqualFold(status.Status, "OK") {
++				msg := status.Message
++				if msg == "" {
++					msg = strings.TrimSpace(string(body))
++				}
++				return helpers.NewToolResultTextError("failed to delete file %d: %s", fileID, msg), nil
++			}
++
++			return helpers.NewToolResultText("File %d deleted.", fileID), nil
++		},
++	}
++}
+diff --git a/internal/twprojects/file_download.go b/internal/twprojects/file_download.go
+new file mode 100644
+index 0000000..f5a1241
+--- /dev/null
++++ b/internal/twprojects/file_download.go
+@@ -0,0 +1,446 @@
++package twprojects
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
 +	"net/http"
 +	"os"
 +	"path/filepath"
@@ -70,22 +1482,28 @@ index 0000000..f881a0d
 +	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 +}
 +
-+// rawTaskFile is the subset of a file record the list tool reads.
++// rawTaskFile is the subset of a v1 task-file record the list tool reads. The
++// v1 /tasks/{id}/files.json response uses hyphenated keys and returns id/size as
++// quoted strings (hence json.Number), and carries the uploader's name as two
++// flat fields rather than a nested object.
 +type rawTaskFile struct {
-+	ID          int64  `json:"id"`
-+	Name        string `json:"name"`
-+	Size        int64  `json:"size"`
-+	FileType    string `json:"fileType"`
-+	ContentType string `json:"contentType"`
-+	CreatedAt   string `json:"createdAt"`
-+	UploadedBy  struct {
-+		FirstName string `json:"firstName"`
-+		LastName  string `json:"lastName"`
-+	} `json:"uploadedBy"`
++	ID           json.Number `json:"id"`
++	Name         string      `json:"name"`
++	OriginalName string      `json:"originalName"`
++	Size         json.Number `json:"size"`
++	UploadedDate string      `json:"uploaded-date"`
++	FirstName    string      `json:"uploaded-by-user-first-name"`
++	LastName     string      `json:"uploaded-by-user-last-name"`
 +}
 +
-+// rawTaskFilesResponse is the subset of the files response the list tool reads.
++// rawTaskFilesResponse is the subset of the v1 task-files response the list tool
++// reads. The files array is nested under the returned "project" object; a
++// top-level "files" is kept as a defensive fallback in case a variant of the
++// endpoint returns it there.
 +type rawTaskFilesResponse struct {
++	Project struct {
++		Files []rawTaskFile `json:"files"`
++	} `json:"project"`
 +	Files []rawTaskFile `json:"files"`
 +}
 +
@@ -225,19 +1643,27 @@ index 0000000..f881a0d
 +				return nil, fmt.Errorf("failed to decode task files response: %w", err)
 +			}
 +
-+			files := make([]taskFile, 0, len(decoded.Files))
-+			for _, f := range decoded.Files {
-+				contentType := f.ContentType
-+				if contentType == "" {
-+					contentType = f.FileType
++			raw := decoded.Project.Files
++			if len(raw) == 0 {
++				raw = decoded.Files
++			}
++
++			files := make([]taskFile, 0, len(raw))
++			for _, f := range raw {
++				id, _ := f.ID.Int64()
++				size, _ := f.Size.Int64()
++				name := f.Name
++				if name == "" {
++					name = f.OriginalName
 +				}
-+				uploadedBy := strings.TrimSpace(f.UploadedBy.FirstName + " " + f.UploadedBy.LastName)
++				contentType := mime.TypeByExtension(filepath.Ext(name))
++				uploadedBy := strings.TrimSpace(f.FirstName + " " + f.LastName)
 +				files = append(files, taskFile{
-+					ID:          f.ID,
-+					Name:        f.Name,
-+					Size:        f.Size,
++					ID:          id,
++					Name:        name,
++					Size:        size,
 +					ContentType: contentType,
-+					CreatedAt:   f.CreatedAt,
++					CreatedAt:   f.UploadedDate,
 +					UploadedBy:  uploadedBy,
 +				})
 +			}
@@ -435,159 +1861,196 @@ index 0000000..f881a0d
 +		},
 +	}
 +}
-diff --git a/internal/twprojects/file_download_test.go b/internal/twprojects/file_download_test.go
+diff --git a/internal/twprojects/file_update.go b/internal/twprojects/file_update.go
 new file mode 100644
-index 0000000..8c1cc9b
+index 0000000..29980a5
 --- /dev/null
-+++ b/internal/twprojects/file_download_test.go
-@@ -0,0 +1,148 @@
-+package twprojects_test
++++ b/internal/twprojects/file_update.go
+@@ -0,0 +1,185 @@
++package twprojects
 +
 +import (
++	"bytes"
++	"context"
 +	"encoding/json"
++	"fmt"
++	"io"
 +	"net/http"
-+	"net/http/httptest"
-+	"os"
-+	"path/filepath"
 +	"strings"
-+	"testing"
 +
++	"github.com/google/jsonschema-go/jsonschema"
 +	"github.com/modelcontextprotocol/go-sdk/mcp"
-+	"github.com/teamwork/mcp/internal/testutil"
-+	"github.com/teamwork/mcp/internal/twprojects"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
 +)
 +
-+// downloadResultSavedTo digs the saved path out of the structured tool result.
-+func downloadResultSavedTo(t *testing.T, result mcp.Result) string {
-+	t.Helper()
-+	callResult, ok := result.(*mcp.CallToolResult)
-+	if !ok {
-+		t.Fatalf("unexpected result type %T", result)
-+	}
-+	if callResult.IsError {
-+		var msg string
-+		for _, c := range callResult.Content {
-+			if tc, ok := c.(*mcp.TextContent); ok {
-+				msg += tc.Text
-+			}
-+		}
-+		t.Fatalf("tool returned error: %s", msg)
-+	}
-+	var payload struct {
-+		SavedTo  string `json:"saved_to"`
-+		FileName string `json:"file_name"`
-+		Bytes    int64  `json:"bytes"`
-+	}
-+	for _, c := range callResult.Content {
-+		if tc, ok := c.(*mcp.TextContent); ok {
-+			if err := json.Unmarshal([]byte(tc.Text), &payload); err == nil && payload.SavedTo != "" {
-+				return payload.SavedTo
-+			}
-+		}
-+	}
-+	t.Fatalf("could not find saved_to in result content")
-+	return ""
++// List of methods available in the Teamwork.com MCP service.
++const (
++	MethodFileUpdate toolsets.Method = "twprojects-update_file"
++)
++
++// fileUpdateRequest is a local HTTP requester for the v1 update-file endpoint.
++// The SDK models no file update, so the requester lives here (no twapi-go-sdk
++// edit). It edits a file's details (display name and/or description) in one
++// call — the same operation as the UI's "Edit File Details" — without any
++// download / re-upload / delete round-trip. It targets a file by its exact ID.
++//
++// https://apidocs.teamwork.com/docs/teamwork/v1/files/put-files-id-json
++type fileUpdateRequest struct {
++	FileID      int64
++	Name        *string
++	Description *string
 +}
 +
-+// TestDownloadFileByVersionID covers the search-driven path: the caller passes
-+// a file-version ID, /files/{id}.json 404s, and the tool resolves the version
-+// to its parent file before downloading.
-+func TestDownloadFileByVersionID(t *testing.T) {
-+	const versionID = "999"
-+	const parentID = "123"
-+	const contents = "hello from teamwork"
++// HTTPRequest builds the PUT request carrying only the supplied fields.
++func (r fileUpdateRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	file := map[string]any{}
++	if r.Name != nil {
++		file["name"] = *r.Name
++	}
++	if r.Description != nil {
++		file["description"] = *r.Description
++	}
++	payload := map[string]any{"file": file}
 +
-+	// Stand-in for the signed download URL the file metadata points at.
-+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-+		_, _ = w.Write([]byte(contents))
-+	}))
-+	defer blob.Close()
-+
-+	fileBody := []byte(`{"file":{"name":"report.pdf","download-URL":"` + blob.URL + `"}}`)
-+	versionBody := []byte(`{"fileVersion":{"file":{"id":"` + parentID + `"},"name":"report.pdf"}}`)
-+
-+	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, []testutil.ProjectsMockRoute{
-+		// The version-ID file lookup must 404 to trigger the fallback.
-+		{Match: "/files/" + versionID + ".json", Status: http.StatusNotFound,
-+			Body: []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`)},
-+		// The version endpoint resolves the parent file ID.
-+		{Match: "/fileversions/" + versionID + ".json", Status: http.StatusOK, Body: versionBody},
-+		// The parent file lookup yields the download URL.
-+		{Match: "/files/" + parentID + ".json", Status: http.StatusOK, Body: fileBody},
-+	}, http.StatusNotFound, []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`))
-+
-+	outPath := filepath.Join(t.TempDir(), "report.pdf")
-+	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
-+		"file_id":  float64(999),
-+		"out_path": outPath,
-+	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
-+		saved := downloadResultSavedTo(t, result)
-+		if saved != outPath {
-+			t.Errorf("saved_to = %q, want %q", saved, outPath)
-+		}
-+		got, err := os.ReadFile(outPath)
-+		if err != nil {
-+			t.Fatalf("failed to read downloaded file: %v", err)
-+		}
-+		if string(got) != contents {
-+			t.Errorf("downloaded contents = %q, want %q", string(got), contents)
-+		}
-+	}))
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode file update request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/files/%d.json", server, r.FileID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
 +}
 +
-+// TestDownloadFileByFileID covers the direct path: a real file ID resolves on
-+// the first /files/{id}.json call with no version fallback.
-+func TestDownloadFileByFileID(t *testing.T) {
-+	const fileID = "456"
-+	const contents = "direct download"
-+
-+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-+		_, _ = w.Write([]byte(contents))
-+	}))
-+	defer blob.Close()
-+
-+	fileBody := []byte(`{"file":{"name":"direct.txt","download-URL":"` + blob.URL + `"}}`)
-+	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, []testutil.ProjectsMockRoute{
-+		{Match: "/files/" + fileID + ".json", Status: http.StatusOK, Body: fileBody},
-+	}, http.StatusNotFound, nil)
-+
-+	outPath := filepath.Join(t.TempDir(), "direct.txt")
-+	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
-+		"file_id":  float64(456),
-+		"out_path": outPath,
-+	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
-+		if got := downloadResultSavedTo(t, result); got != outPath {
-+			t.Errorf("saved_to = %q, want %q", got, outPath)
-+		}
-+	}))
-+}
-+
-+// TestDownloadFileNotFound covers a genuinely missing ID: both the file and the
-+// file-version lookups 404, so the tool returns a clear error.
-+func TestDownloadFileNotFound(t *testing.T) {
-+	mcpServer := testutil.ProjectsMCPServerRoutedMock(t, nil,
-+		http.StatusNotFound, []byte(`{"MESSAGE":"Not Found","STATUS":"Error"}`))
-+
-+	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodDownloadFile.String(), map[string]any{
-+		"file_id": float64(404404),
-+	}, testutil.ExecuteToolRequestWithCheckMessage(func(t *testing.T, result mcp.Result) {
-+		callResult, ok := result.(*mcp.CallToolResult)
-+		if !ok {
-+			t.Fatalf("unexpected result type %T", result)
-+		}
-+		if !callResult.IsError {
-+			t.Fatalf("expected an error result for a missing file ID")
-+		}
-+		var msg string
-+		for _, c := range callResult.Content {
-+			if tc, ok := c.(*mcp.TextContent); ok {
-+				msg += tc.Text
++// UpdateFile edits an existing Teamwork file's details — its display name
++// (rename) and/or its description — in a single API call.
++func UpdateFile(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodFileUpdate),
++			Description: "Rename a Teamwork file or edit its details (display name and/or description) in a " +
++				"single call — the same operation as the UI's \"Edit File Details\". Use this instead of " +
++				"downloading, re-uploading and deleting a file just to change its name. Renaming changes " +
++				"only the file's display name in Teamwork (the underlying stored file and, for files linked " +
++				"from SharePoint/Google Drive/etc., the source file are unchanged); include the file " +
++				"extension in the new name. Pass the exact file_id and at least one of name or description. " +
++				"A file-version ID is not a file ID and will not resolve here — pass the file's own ID.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Update File",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"file_id": {
++						Type:        "integer",
++						Description: "The exact Teamwork file ID to update.",
++					},
++					"name": {
++						Description: "New display name for the file (include the extension, e.g. \"Report Q3.pdf\"). " +
++							"Omit to leave the name unchanged.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string"},
++							{Type: "null"},
++						},
++					},
++					"description": {
++						Description: "New description for the file. Pass an empty string to clear it; omit to leave " +
++							"the description unchanged.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "string"},
++							{Type: "null"},
++						},
++					},
++				},
++				Required: []string{"file_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
 +			}
-+		}
-+		if !strings.Contains(msg, "failed to fetch file metadata") {
-+			t.Errorf("error message = %q, want it to mention metadata fetch failure", msg)
-+		}
-+	}))
++
++			var fileID int64
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&fileID, "file_id"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			// Read name/description directly so we can distinguish "omitted"
++			// (leave unchanged) from "supplied empty string" (clear it).
++			var name, description *string
++			if raw, ok := arguments["name"]; ok && raw != nil {
++				s, ok := raw.(string)
++				if !ok {
++					return helpers.NewToolResultTextError("invalid parameters: name must be a string"), nil
++				}
++				name = &s
++			}
++			if raw, ok := arguments["description"]; ok && raw != nil {
++				s, ok := raw.(string)
++				if !ok {
++					return helpers.NewToolResultTextError("invalid parameters: description must be a string"), nil
++				}
++				description = &s
++			}
++
++			if name == nil && description == nil {
++				return helpers.NewToolResultTextError("provide at least one of name or description to update"), nil
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, fileUpdateRequest{
++				FileID:      fileID,
++				Name:        name,
++				Description: description,
++			})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to update file")
++			}
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to update file"),
++					"failed to update file",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			// The v1 endpoint returns 200 with {"STATUS":"OK"} on success, but can
++			// also return 200 with {"STATUS":"Error"} for some failures — treat a
++			// non-OK STATUS as a failure so a bad update is never reported as success.
++			var status struct {
++				Status  string `json:"STATUS"`
++				Message string `json:"MESSAGE"`
++			}
++			_ = json.Unmarshal(body, &status)
++			if status.Status != "" && !strings.EqualFold(status.Status, "OK") {
++				msg := status.Message
++				if msg == "" {
++					msg = strings.TrimSpace(string(body))
++				}
++				return helpers.NewToolResultTextError("failed to update file %d: %s", fileID, msg), nil
++			}
++
++			switch {
++			case name != nil && description != nil:
++				return helpers.NewToolResultText("File %d renamed to %q and description updated.", fileID, *name), nil
++			case name != nil:
++				return helpers.NewToolResultText("File %d renamed to %q.", fileID, *name), nil
++			default:
++				return helpers.NewToolResultText("File %d description updated.", fileID), nil
++			}
++		},
++	}
 +}
 diff --git a/internal/twprojects/files.go b/internal/twprojects/files.go
 new file mode 100644
@@ -915,6 +2378,1133 @@ index 0000000..e054d31
 +		},
 +	}
 +}
+diff --git a/internal/twprojects/inline_image.go b/internal/twprojects/inline_image.go
+new file mode 100644
+index 0000000..d7faedd
+--- /dev/null
++++ b/internal/twprojects/inline_image.go
+@@ -0,0 +1,203 @@
++package twprojects
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// Inline image upload.
++//
++// Pasting an image into a Teamwork rich-text field (a comment, description,
++// message, etc.) does NOT go through the pending-files attachment flow that
++// upload_file uses - that produces a file attachment, not a rendered image.
++// Instead the editor does a two-step presigned upload:
++//
++//  1. POST /projects/api/v3/inlineimage/presigned.json  {filename,size}
++//     -> {reference, uploadURL (presigned S3 PUT), downloadURL (public URL)}
++//  2. PUT the raw bytes to uploadURL (no Teamwork auth; the presigned URL is
++//     self-signed). The signature covers content-length;host;x-amz-acl, so the
++//     PUT MUST send x-amz-acl: public-read.
++//
++// The resulting image lives in the public tw-inlineimages bucket, so the
++// returned URL can be embedded directly in an HTML <img> tag in any rich-text
++// body (e.g. via create_comment with an HTML content type) and renders inline.
++const (
++	MethodInlineImageUpload toolsets.Method = "twprojects-upload_inline_image"
++)
++
++// inlineImagePresignRequest asks Teamwork for a presigned S3 upload URL for an
++// inline image. It implements twapi.HTTPRequester so the shared engine injects
++// the Teamwork bearer authentication.
++type inlineImagePresignRequest struct {
++	Filename string
++	Size     int
++}
++
++func (r inlineImagePresignRequest) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	payload := map[string]any{
++		"filename": r.Filename,
++		"size":     r.Size,
++	}
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(payload); err != nil {
++		return nil, fmt.Errorf("failed to encode inline image presign request: %w", err)
++	}
++	uri := fmt.Sprintf("%s/projects/api/v3/inlineimage/presigned.json", server)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &body)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// InlineImageUpload uploads a local image so it can be embedded as a rendered
++// inline image in a Teamwork rich-text body, and returns the public image URL.
++// This is distinct from upload_file, which produces a file attachment.
++func InlineImageUpload(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodInlineImageUpload),
++			Description: "Upload a local image and get back a public URL that renders as an inline image (not a " +
++				"file attachment). Use this when you want an image to display inside a comment, message or " +
++				"description - embed the returned url in an HTML <img> tag in the rich-text body (e.g. call " +
++				"create_comment with an HTML content type and body like <img src=\"...\">). Provide the absolute " +
++				"file_path on disk. This is different from upload_file, which attaches the image as a downloadable " +
++				"file rather than showing it inline.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Upload Inline Image",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"file_path": {
++						Type:        "string",
++						Description: "Absolute path to the local image file to upload (e.g. a PNG or JPEG screenshot).",
++					},
++					"file_name": {
++						Description: "Optional override for the uploaded file name (include the extension). " +
++							"Defaults to the file_path base name.",
++						AnyOf: []*jsonschema.Schema{{Type: "string"}, {Type: "null"}},
++					},
++				},
++				Required: []string{"file_path"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var filePath, fileName string
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredParam(&filePath, "file_path"),
++				helpers.OptionalParam(&fileName, "file_name"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			data, err := os.ReadFile(filePath)
++			if err != nil {
++				return helpers.NewToolResultTextError("failed to read file %q: %s", filePath, err.Error()), nil
++			}
++			if fileName == "" {
++				fileName = filepath.Base(filePath)
++			}
++			contentType := mime.TypeByExtension(filepath.Ext(fileName))
++			if contentType == "" {
++				contentType = http.DetectContentType(data)
++			}
++
++			// Step 1: ask Teamwork for a presigned upload URL.
++			presignResp, err := twapi.ExecuteRaw(ctx, engine, inlineImagePresignRequest{
++				Filename: fileName,
++				Size:     len(data),
++			})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to request inline image upload URL")
++			}
++			presignBody, _ := io.ReadAll(presignResp.Body)
++			_ = presignResp.Body.Close()
++			if presignResp.StatusCode < 200 || presignResp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(presignResp, "failed to request inline image upload URL"),
++					"failed to request inline image upload URL")
++			}
++			var presign struct {
++				Reference   string `json:"reference"`
++				UploadURL   string `json:"uploadURL"`
++				DownloadURL string `json:"downloadURL"`
++			}
++			if err := json.Unmarshal(presignBody, &presign); err != nil {
++				return helpers.NewToolResultTextError(
++					"failed to parse presign response: %s (body: %s)", err.Error(), strings.TrimSpace(string(presignBody))), nil
++			}
++			if presign.UploadURL == "" {
++				return helpers.NewToolResultTextError(
++					"presign succeeded but no uploadURL was returned (body: %s)", strings.TrimSpace(string(presignBody))), nil
++			}
++
++			// Step 2: PUT the bytes to the presigned S3 URL. The presigned
++			// signature covers x-amz-acl, so it must be sent as public-read.
++			putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, presign.UploadURL, bytes.NewReader(data))
++			if err != nil {
++				return nil, fmt.Errorf("failed to build inline image upload request: %w", err)
++			}
++			putReq.Header.Set("x-amz-acl", "public-read")
++			putReq.Header.Set("Content-Type", contentType)
++			putReq.ContentLength = int64(len(data))
++			putResp, err := http.DefaultClient.Do(putReq)
++			if err != nil {
++				return helpers.NewToolResultTextError("inline image upload failed: %s", err.Error()), nil
++			}
++			putBody, _ := io.ReadAll(putResp.Body)
++			_ = putResp.Body.Close()
++			if putResp.StatusCode < 200 || putResp.StatusCode >= 300 {
++				return helpers.NewToolResultTextError(
++					"inline image upload returned status %d: %s", putResp.StatusCode, strings.TrimSpace(string(putBody))), nil
++			}
++
++			// The public display URL: prefer the API's downloadURL, else the
++			// uploadURL with its presigned query stripped.
++			displayURL := presign.DownloadURL
++			if displayURL == "" {
++				if u, perr := url.Parse(presign.UploadURL); perr == nil {
++					u.RawQuery = ""
++					displayURL = u.String()
++				}
++			}
++
++			out := struct {
++				URL       string `json:"url"`
++				Reference string `json:"reference"`
++				FileName  string `json:"file_name"`
++				HTML      string `json:"html_snippet"`
++				Message   string `json:"message"`
++			}{
++				URL:       displayURL,
++				Reference: presign.Reference,
++				FileName:  fileName,
++				HTML:      fmt.Sprintf(`<img src=%q alt=%q>`, displayURL, fileName),
++				Message: "Uploaded as an inline image. Embed the html_snippet (or url in an <img> tag) in a " +
++					"rich-text body - e.g. create_comment with an HTML content type - to render it inline.",
++			}
++			return helpers.NewToolResultJSON(out)
++		},
++	}
++}
+diff --git a/internal/twprojects/message_category.go b/internal/twprojects/message_category.go
+new file mode 100644
+index 0000000..4b28280
+--- /dev/null
++++ b/internal/twprojects/message_category.go
+@@ -0,0 +1,500 @@
++package twprojects
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"sort"
++	"strconv"
++	"strings"
++
++	"github.com/google/jsonschema-go/jsonschema"
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/teamwork/mcp/internal/helpers"
++	"github.com/teamwork/mcp/internal/toolsets"
++	twapi "github.com/teamwork/twapi-go-sdk"
++)
++
++// Message-category tools. The stock tw-mcp binary has no way to list or set a
++// message's category, so these are local requesters over the Teamwork v1 REST
++// API (no twapi-go-sdk edit).
++const (
++	MethodSetMessageCategory    toolsets.Method = "twprojects-set_message_category"
++	MethodListMessageCategories toolsets.Method = "twprojects-list_message_categories"
++)
++
++// --- requesters --------------------------------------------------------------
++
++// messageGetRequester fetches a single message so we can read its project id.
++type messageGetRequester struct {
++	messageID int64
++}
++
++func (r messageGetRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/messages/%d.json", server, r.messageID)
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// messageCategoriesRequester lists the message categories defined on a project.
++type messageCategoriesRequester struct {
++	projectID int64
++}
++
++func (r messageCategoriesRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/projects/%d/messageCategories.json", server, r.projectID)
++	return http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
++}
++
++// messageSetCategoryRequester PUTs a new category id onto a message. A
++// category id of 0 clears the message's category.
++type messageSetCategoryRequester struct {
++	messageID  int64
++	categoryID int64
++}
++
++func (r messageSetCategoryRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/messages/%d.json", server, r.messageID)
++	body := struct {
++		Post struct {
++			CategoryID int64 `json:"category-id"`
++		} `json:"post"`
++	}{}
++	body.Post.CategoryID = r.categoryID
++	var buf bytes.Buffer
++	if err := json.NewEncoder(&buf).Encode(body); err != nil {
++		return nil, fmt.Errorf("failed to encode set message category request: %w", err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, &buf)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
++// --- response shapes (v1 API — hyphenated keys, ids often quoted strings) ----
++
++// flexID leniently decodes an id that the v1 API may return as a quoted string
++// ("123"), a bare number (123), an empty string (""), or null — all normalised
++// to a trimmed decimal string ("" when absent). json.Number can't handle the
++// empty-string case (top-level categories return parent-id ""), which is why
++// this exists.
++type flexID string
++
++func (f *flexID) UnmarshalJSON(data []byte) error {
++	s := strings.TrimSpace(string(data))
++	if s == "" || s == "null" {
++		*f = ""
++		return nil
++	}
++	if s[0] == '"' {
++		var str string
++		if err := json.Unmarshal(data, &str); err != nil {
++			return err
++		}
++		*f = flexID(strings.TrimSpace(str))
++		return nil
++	}
++	*f = flexID(s)
++	return nil
++}
++
++func (f flexID) String() string { return string(f) }
++
++// rawMessage is the subset of GET /messages/{id}.json the tool reads. v1
++// nests the record under "post" (older installs use "message"); ids come back
++// as quoted strings, so flexID tolerates string/number/empty forms.
++type rawMessage struct {
++	ProjectID flexID `json:"project-id"`
++}
++
++type rawMessageResponse struct {
++	Post    *rawMessage `json:"post"`
++	Message *rawMessage `json:"message"`
++}
++
++func (r rawMessageResponse) record() *rawMessage {
++	if r.Post != nil {
++		return r.Post
++	}
++	return r.Message
++}
++
++// rawCategory is one entry from GET /projects/{id}/messageCategories.json.
++type rawCategory struct {
++	ID       flexID `json:"id"`
++	Name     string `json:"name"`
++	ParentID flexID `json:"parent-id"`
++}
++
++// rawCategoriesResponse tolerates both key spellings seen across installs.
++type rawCategoriesResponse struct {
++	Categories        []rawCategory `json:"categories"`
++	MessageCategories []rawCategory `json:"messageCategories"`
++}
++
++func (r rawCategoriesResponse) list() []rawCategory {
++	if len(r.Categories) > 0 {
++		return r.Categories
++	}
++	return r.MessageCategories
++}
++
++// --- category tree helpers ---------------------------------------------------
++
++type categoryNode struct {
++	name   string
++	parent string
++}
++
++// buildCategoryTree maps category id -> {name, parent}. Ids are normalised to
++// their decimal string form so lookups are consistent regardless of whether
++// the API returned them quoted or numeric.
++func buildCategoryTree(cats []rawCategory) map[string]categoryNode {
++	tree := make(map[string]categoryNode, len(cats))
++	for _, c := range cats {
++		id := strings.TrimSpace(c.ID.String())
++		if id == "" {
++			continue
++		}
++		parent := strings.TrimSpace(c.ParentID.String())
++		if parent == "0" {
++			parent = ""
++		}
++		tree[id] = categoryNode{name: c.Name, parent: parent}
++	}
++	return tree
++}
++
++// categoryPath renders the "Parent > Child" path for a category id, walking up
++// the parent chain. Cycle-safe.
++func categoryPath(tree map[string]categoryNode, id string) string {
++	var names []string
++	seen := make(map[string]bool)
++	for id != "" && !seen[id] {
++		seen[id] = true
++		node, ok := tree[id]
++		if !ok {
++			break
++		}
++		if node.name != "" {
++			names = append(names, node.name)
++		}
++		id = node.parent
++	}
++	// reverse
++	for i, j := 0, len(names)-1; i < j; i, j = i+1, j-1 {
++		names[i], names[j] = names[j], names[i]
++	}
++	return strings.Join(names, " > ")
++}
++
++// resolveCategory maps a human path/leaf ("Time Reporting > 2026" or "2026")
++// to a category id within the tree. Returns the id and its full path, or an
++// error describing why (not found / ambiguous), listing the available paths.
++func resolveCategory(tree map[string]categoryNode, pathInput string) (string, string, error) {
++	if len(tree) == 0 {
++		return "", "", fmt.Errorf("this project has no message categories")
++	}
++	segments := make([]string, 0)
++	for _, s := range strings.Split(pathInput, ">") {
++		if s = strings.TrimSpace(s); s != "" {
++			segments = append(segments, s)
++		}
++	}
++	if len(segments) == 0 {
++		return "", "", fmt.Errorf("empty category_path")
++	}
++	wantFull := strings.ToLower(strings.Join(segments, " > "))
++	wantLeaf := strings.ToLower(segments[len(segments)-1])
++
++	type match struct{ id, full string }
++	var matches []match
++	for id, node := range tree {
++		full := categoryPath(tree, id)
++		if len(segments) > 1 {
++			if strings.EqualFold(full, wantFull) {
++				matches = append(matches, match{id, full})
++			}
++		} else if strings.ToLower(node.name) == wantLeaf {
++			matches = append(matches, match{id, full})
++		}
++	}
++	switch len(matches) {
++	case 1:
++		return matches[0].id, matches[0].full, nil
++	case 0:
++		avail := make([]string, 0, len(tree))
++		for id := range tree {
++			avail = append(avail, categoryPath(tree, id))
++		}
++		return "", "", fmt.Errorf("no category matches %q. Available: %s",
++			pathInput, strings.Join(avail, "; "))
++	default:
++		opts := make([]string, 0, len(matches))
++		for _, m := range matches {
++			opts = append(opts, fmt.Sprintf("%s (id %s)", m.full, m.id))
++		}
++		return "", "", fmt.Errorf("%q is ambiguous — matches: %s. Re-run with the full path or category_id",
++			pathInput, strings.Join(opts, "; "))
++	}
++}
++
++// --- tool --------------------------------------------------------------------
++
++// SetMessageCategory sets or clears the category of a Teamwork message. Provide
++// message_id plus EITHER category_id (numeric; 0 clears) OR category_path (a
++// human path resolved within the message's own project).
++func SetMessageCategory(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodSetMessageCategory),
++			Description: "Set (or clear) the category of a Teamwork message. Provide message_id plus " +
++				"EITHER category_id (the numeric id) OR category_path (a human path resolved within " +
++				"the message's project, e.g. 'Time Reporting > 2026'). To clear the category, pass " +
++				"category_id = 0. Find category ids/paths via the message's project message categories.",
++			Annotations: &mcp.ToolAnnotations{
++				Title: "Set Message Category",
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"message_id": {
++						Type:        "integer",
++						Description: "ID of the message whose category to set.",
++					},
++					"category_id": {
++						Type:        "integer",
++						Description: "Numeric category id to assign; 0 clears the category. Omit to resolve by category_path.",
++					},
++					"category_path": {
++						Type: "string",
++						Description: "Category path or leaf name to resolve within the message's project, " +
++							"e.g. 'Time Reporting > 2026'. Ignored when category_id is given.",
++					},
++				},
++				Required: []string{"message_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++
++			var messageID, categoryID int64
++			var categoryPathArg string
++			err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&messageID, "message_id"),
++				helpers.OptionalNumericParam(&categoryID, "category_id"),
++				helpers.OptionalParam(&categoryPathArg, "category_path"),
++			)
++			if err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++			_, hasCategoryID := arguments["category_id"]
++
++			resolvedPath := ""
++			if !hasCategoryID {
++				// Resolve by path: need the message's project, then its categories.
++				if strings.TrimSpace(categoryPathArg) == "" {
++					return helpers.NewToolResultTextError(
++						"provide either category_id (0 to clear) or category_path"), nil
++				}
++				projectID, apiErr := fetchMessageProjectID(ctx, engine, messageID)
++				if apiErr != nil {
++					return apiErr, nil
++				}
++				tree, apiErr2 := fetchCategoryTree(ctx, engine, projectID)
++				if apiErr2 != nil {
++					return apiErr2, nil
++				}
++				id, full, resErr := resolveCategory(tree, categoryPathArg)
++				if resErr != nil {
++					return helpers.NewToolResultTextError("%s", resErr.Error()), nil
++				}
++				parsed, convErr := strconv.ParseInt(id, 10, 64)
++				if convErr != nil {
++					return helpers.NewToolResultTextError("resolved category id %q is not numeric", id), nil
++				}
++				categoryID = parsed
++				resolvedPath = full
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine,
++				messageSetCategoryRequester{messageID: messageID, categoryID: categoryID})
++			if err != nil {
++				return helpers.HandleAPIError(err, "failed to set message category")
++			}
++			_, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to set message category"),
++					"failed to set message category",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			if categoryID == 0 {
++				return helpers.NewToolResultText("Cleared category on message %d.", messageID), nil
++			}
++			if resolvedPath != "" {
++				return helpers.NewToolResultText(
++					"Set category of message %d to %q (id %d).", messageID, resolvedPath, categoryID), nil
++			}
++			return helpers.NewToolResultText(
++				"Set category of message %d to id %d.", messageID, categoryID), nil
++		},
++	}
++}
++
++// messageCategory is one entry returned by list_message_categories.
++type messageCategory struct {
++	ID   int64  `json:"id"`
++	Name string `json:"name"`
++	Path string `json:"path"`
++}
++
++type listMessageCategoriesResult struct {
++	ProjectID  int64             `json:"project_id"`
++	Returned   int               `json:"returned"`
++	Categories []messageCategory `json:"categories"`
++}
++
++// ListMessageCategories lists the message categories defined on a project, so
++// the caller can discover valid ids/paths before calling set_message_category.
++// These are MESSAGE categories, a separate id space from project categories
++// (list_project_categories).
++func ListMessageCategories(engine *twapi.Engine) toolsets.ToolWrapper {
++	return toolsets.ToolWrapper{
++		Tool: &mcp.Tool{
++			Name: string(MethodListMessageCategories),
++			Description: "List the message categories defined on a project. Use this to discover valid " +
++				"category ids and paths before calling set_message_category. Returns each category's id, " +
++				"name and full path (e.g. 'Time Reporting > 2026'). NOTE: these are MESSAGE categories, a " +
++				"separate id space from project categories (list_project_categories) — do not mix them.",
++			Annotations: &mcp.ToolAnnotations{
++				Title:        "List Message Categories",
++				ReadOnlyHint: true,
++			},
++			InputSchema: &jsonschema.Schema{
++				Type: "object",
++				Properties: map[string]*jsonschema.Schema{
++					"project_id": {
++						Type:        "integer",
++						Description: "The ID of the project whose message categories to list.",
++					},
++				},
++				Required: []string{"project_id"},
++			},
++		},
++		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++			var arguments map[string]any
++			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
++				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
++			}
++			var projectID int64
++			if err := helpers.ParamGroup(arguments,
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++			); err != nil {
++				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
++			}
++
++			tree, apiErr := fetchCategoryTree(ctx, engine, projectID)
++			if apiErr != nil {
++				return apiErr, nil
++			}
++
++			result := listMessageCategoriesResult{ProjectID: projectID, Categories: []messageCategory{}}
++			for id, node := range tree {
++				parsed, convErr := strconv.ParseInt(id, 10, 64)
++				if convErr != nil {
++					continue
++				}
++				result.Categories = append(result.Categories, messageCategory{
++					ID:   parsed,
++					Name: node.name,
++					Path: categoryPath(tree, id),
++				})
++			}
++			// Stable order: by path, then id.
++			sort.Slice(result.Categories, func(i, j int) bool {
++				if result.Categories[i].Path == result.Categories[j].Path {
++					return result.Categories[i].ID < result.Categories[j].ID
++				}
++				return result.Categories[i].Path < result.Categories[j].Path
++			})
++			result.Returned = len(result.Categories)
++
++			var buf bytes.Buffer
++			enc := json.NewEncoder(&buf)
++			enc.SetEscapeHTML(false) // keep ">" in category paths readable, not >
++			if marshalErr := enc.Encode(result); marshalErr != nil {
++				return nil, fmt.Errorf("failed to encode categories: %w", marshalErr)
++			}
++			return helpers.NewToolResultText("%s", strings.TrimSpace(buf.String())), nil
++		},
++	}
++}
++
++// fetchMessageProjectID reads a message and returns its project id.
++func fetchMessageProjectID(ctx context.Context, engine *twapi.Engine, messageID int64) (int64, *mcp.CallToolResult) {
++	resp, err := twapi.ExecuteRaw(ctx, engine, messageGetRequester{messageID: messageID})
++	if err != nil {
++		r, _ := helpers.HandleAPIError(err, "failed to fetch message")
++		return 0, r
++	}
++	body, readErr := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		r, _ := helpers.HandleAPIError(
++			twapi.NewHTTPError(resp, "failed to fetch message"), "failed to fetch message")
++		return 0, r
++	}
++	if readErr != nil {
++		return 0, helpers.NewToolResultTextError("failed to read message response: %s", readErr.Error())
++	}
++	var decoded rawMessageResponse
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		return 0, helpers.NewToolResultTextError("failed to decode message response: %s", err.Error())
++	}
++	rec := decoded.record()
++	if rec == nil {
++		return 0, helpers.NewToolResultTextError("message %d not found", messageID)
++	}
++	pid, err := strconv.ParseInt(strings.TrimSpace(rec.ProjectID.String()), 10, 64)
++	if err != nil || pid == 0 {
++		return 0, helpers.NewToolResultTextError("could not determine the project for message %d", messageID)
++	}
++	return pid, nil
++}
++
++// fetchCategoryTree loads a project's message categories as an id->node tree.
++func fetchCategoryTree(ctx context.Context, engine *twapi.Engine, projectID int64) (map[string]categoryNode, *mcp.CallToolResult) {
++	resp, err := twapi.ExecuteRaw(ctx, engine, messageCategoriesRequester{projectID: projectID})
++	if err != nil {
++		r, _ := helpers.HandleAPIError(err, "failed to fetch message categories")
++		return nil, r
++	}
++	body, readErr := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		r, _ := helpers.HandleAPIError(
++			twapi.NewHTTPError(resp, "failed to fetch message categories"), "failed to fetch message categories")
++		return nil, r
++	}
++	if readErr != nil {
++		return nil, helpers.NewToolResultTextError("failed to read categories response: %s", readErr.Error())
++	}
++	var decoded rawCategoriesResponse
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		return nil, helpers.NewToolResultTextError("failed to decode categories response: %s", err.Error())
++	}
++	return buildCategoryTree(decoded.list()), nil
++}
+diff --git a/internal/twprojects/message_replies.go b/internal/twprojects/message_replies.go
+index b892d50..018022e 100644
+--- a/internal/twprojects/message_replies.go
++++ b/internal/twprojects/message_replies.go
+@@ -77,8 +77,7 @@ func MessageReplyCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						},
+ 					},
+ 					"notify": {
+-						Description: "Who to notify of the new reply.",
+-						Default:     json.RawMessage(`"all"`),
++						Description: "Who to notify of the new reply. DEFAULT IS NO ONE — omit this to avoid notifying anyone. Pass \"all\" to notify every project member.",
+ 						AnyOf: []*jsonschema.Schema{
+ 							{
+ 								AnyOf: []*jsonschema.Schema{
+@@ -137,7 +136,10 @@ func MessageReplyCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						"or an object"), nil
+ 				}
+ 			} else {
+-				messageReplyCreateRequest.Notify = projects.NewMessageNotifyAll()
++				// Default: notify no one (empty recipient list). Avoids spamming the
++				// whole project when the caller doesn't specify; pass notify:"all" to
++				// notify every project member explicitly.
++				messageReplyCreateRequest.Notify = projects.NewMessageNotifyGroup(projects.LegacyUserGroups{})
+ 			}
+ 
+ 			messageReply, err := projects.MessageReplyCreate(ctx, engine, messageReplyCreateRequest)
+@@ -180,8 +182,7 @@ func MessageReplyUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						},
+ 					},
+ 					"notify": {
+-						Description: "Who to notify of the reply update.",
+-						Default:     json.RawMessage(`"all"`),
++						Description: "Who to notify of the reply update. DEFAULT IS NO ONE — omit this to avoid notifying anyone. Pass \"all\" to notify every project member.",
+ 						AnyOf: []*jsonschema.Schema{
+ 							{
+ 								AnyOf: []*jsonschema.Schema{
+@@ -240,7 +241,10 @@ func MessageReplyUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						"or an object"), nil
+ 				}
+ 			} else {
+-				messageReplyUpdateRequest.Notify = projects.NewMessageNotifyAll()
++				// Default: notify no one (empty recipient list). Avoids spamming the
++				// whole project when the caller doesn't specify; pass notify:"all" to
++				// notify every project member explicitly.
++				messageReplyUpdateRequest.Notify = projects.NewMessageNotifyGroup(projects.LegacyUserGroups{})
+ 			}
+ 
+ 			_, err = projects.MessageReplyUpdate(ctx, engine, messageReplyUpdateRequest)
+diff --git a/internal/twprojects/messages.go b/internal/twprojects/messages.go
+index 599a8f1..d1966e2 100644
+--- a/internal/twprojects/messages.go
++++ b/internal/twprojects/messages.go
+@@ -81,8 +81,7 @@ func MessageCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						},
+ 					},
+ 					"notify": {
+-						Description: "Who to notify of the new message.",
+-						Default:     json.RawMessage(`"all"`),
++						Description: "Who to notify of the new message. DEFAULT IS NO ONE — omit this to avoid notifying anyone. Pass \"all\" to notify every project member.",
+ 						AnyOf: []*jsonschema.Schema{
+ 							{
+ 								AnyOf: []*jsonschema.Schema{
+@@ -142,7 +141,10 @@ func MessageCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						"or an object"), nil
+ 				}
+ 			} else {
+-				messageCreateRequest.Notify = projects.NewMessageNotifyAll()
++				// Default: notify no one (empty recipient list). Avoids spamming the
++				// whole project when the caller doesn't specify; pass notify:"all" to
++				// notify every project member explicitly.
++				messageCreateRequest.Notify = projects.NewMessageNotifyGroup(projects.LegacyUserGroups{})
+ 			}
+ 
+ 			message, err := projects.MessageCreate(ctx, engine, messageCreateRequest)
+@@ -199,8 +201,7 @@ func MessageUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						},
+ 					},
+ 					"notify": {
+-						Description: "Who to notify of the message update.",
+-						Default:     json.RawMessage(`"all"`),
++						Description: "Who to notify of the message update. DEFAULT IS NO ONE — omit this to avoid notifying anyone. Pass \"all\" to notify every project member.",
+ 						AnyOf: []*jsonschema.Schema{
+ 							{
+ 								AnyOf: []*jsonschema.Schema{
+@@ -260,7 +261,10 @@ func MessageUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						"or an object"), nil
+ 				}
+ 			} else {
+-				messageUpdateRequest.Notify = projects.NewMessageNotifyAll()
++				// Default: notify no one (empty recipient list). Avoids spamming the
++				// whole project when the caller doesn't specify; pass notify:"all" to
++				// notify every project member explicitly.
++				messageUpdateRequest.Notify = projects.NewMessageNotifyGroup(projects.LegacyUserGroups{})
+ 			}
+ 
+ 			_, err = projects.MessageUpdate(ctx, engine, messageUpdateRequest)
+diff --git a/internal/twprojects/notebooks.go b/internal/twprojects/notebooks.go
+index 502bc6c..1f95052 100644
+--- a/internal/twprojects/notebooks.go
++++ b/internal/twprojects/notebooks.go
+@@ -1,6 +1,7 @@
+ package twprojects
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -48,6 +49,58 @@ func init() {
+ 	helpers.WithMetaWebLinkSchema(notebookListOutputSchema)
+ }
+ 
++// notebookPrivacy is the v3 privacy object: the users, companies, and teams
++// granted access when a notebook is private. The SDK's NotebookCreateRequest
++// does not model privacy, so it is built here and sent via ExecuteRaw.
++type notebookPrivacy struct {
++	UserIDs    []int64 `json:"userIds,omitempty"`
++	CompanyIDs []int64 `json:"companyIds,omitempty"`
++	TeamIDs    []int64 `json:"teamIds,omitempty"`
++}
++
++// notebookCreatePayload is the request body for the v3 create-notebook
++// endpoint, including the isPrivate/privacy fields the SDK type omits.
++type notebookCreatePayload struct {
++	Name        string           `json:"name"`
++	Description *string          `json:"description,omitempty"`
++	Contents    string           `json:"contents"`
++	Type        string           `json:"type"`
++	TagIDs      []int64          `json:"tagIds,omitempty"`
++	CategoryID  *int64           `json:"categoryId,omitempty"`
++	IsPrivate   *bool            `json:"isPrivate,omitempty"`
++	Privacy     *notebookPrivacy `json:"privacy,omitempty"`
++}
++
++// notebookCreateRequester is a local HTTP requester for the v3 create-notebook
++// endpoint. It exists (instead of the SDK's projects.NotebookCreate) so the
++// request body can carry isPrivate/privacy, which the SDK type does not model —
++// no twapi-go-sdk edit.
++type notebookCreateRequester struct {
++	projectID int64
++	payload   notebookCreatePayload
++}
++
++// HTTPRequest builds the POST request for creating a notebook.
++func (r notebookCreateRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/projects/api/v3/projects/%d/notebooks.json", server, r.projectID)
++
++	body := struct {
++		Notebook notebookCreatePayload `json:"notebook"`
++	}{Notebook: r.payload}
++
++	var buf bytes.Buffer
++	if err := json.NewEncoder(&buf).Encode(body); err != nil {
++		return nil, fmt.Errorf("failed to encode create notebook request: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &buf)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
+ // NotebookCreate creates a notebook in Teamwork.com.
+ func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 	return toolsets.ToolWrapper{
+@@ -85,43 +138,165 @@ func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						Enum:        []any{"MARKDOWN", "HTML"},
+ 					},
+ 					"tag_ids": helpers.TagIDsAssociateSchema("notebook"),
++					"category_id": {
++						Description: "The ID of the notebook category to file this notebook under. " +
++							"Omit to leave the notebook uncategorised.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "integer"},
++							{Type: "null"},
++						},
++					},
++					"private": {
++						Type: "boolean",
++						Description: "When true, the notebook is private — visible only to the users, companies, " +
++							"and teams listed in privacy_user_ids/privacy_company_ids/privacy_team_ids (plus site " +
++							"administrators in the owner company, who always retain access). Defaults to false, " +
++							"which makes the notebook visible to everyone on the project. If true with no IDs " +
++							"provided, only the creator and site admins can see it.",
++					},
++					"privacy_user_ids": {
++						Description: "User IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
++					"privacy_company_ids": {
++						Description: "Company IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
++					"privacy_team_ids": {
++						Description: "Team IDs granted access when private is true.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
++							{Type: "null"},
++						},
++					},
+ 				},
+ 				Required: []string{"name", "project_id", "contents", "type"},
+ 			},
+ 		},
+ 		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+-			var notebookCreateRequest projects.NotebookCreateRequest
+-
+ 			var arguments map[string]any
+ 			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
+ 				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
+ 			}
++
++			var projectID int64
++			var payload notebookCreatePayload
++			var nbType projects.NotebookType
++			var private bool
++			var privacy notebookPrivacy
+ 			err := helpers.ParamGroup(arguments,
+-				helpers.RequiredNumericParam(&notebookCreateRequest.Path.ProjectID, "project_id"),
+-				helpers.RequiredParam(&notebookCreateRequest.Name, "name"),
+-				helpers.OptionalPointerParam(&notebookCreateRequest.Description, "description"),
+-				helpers.RequiredParam(&notebookCreateRequest.Contents, "contents"),
+-				helpers.RequiredParam(&notebookCreateRequest.Type, "type",
++				helpers.RequiredNumericParam(&projectID, "project_id"),
++				helpers.RequiredParam(&payload.Name, "name"),
++				helpers.OptionalPointerParam(&payload.Description, "description"),
++				helpers.RequiredParam(&payload.Contents, "contents"),
++				helpers.RequiredParam(&nbType, "type",
+ 					helpers.RestrictValues(
+ 						projects.NotebookTypeMarkdown,
+ 						projects.NotebookTypeHTML,
+ 					),
+ 				),
+-				helpers.OptionalNumericListParam(&notebookCreateRequest.TagIDs, "tag_ids"),
++				helpers.OptionalNumericListParam(&payload.TagIDs, "tag_ids"),
++				helpers.OptionalNumericPointerParam(&payload.CategoryID, "category_id"),
++				helpers.OptionalParam(&private, "private"),
++				helpers.OptionalNumericListParam(&privacy.UserIDs, "privacy_user_ids"),
++				helpers.OptionalNumericListParam(&privacy.CompanyIDs, "privacy_company_ids"),
++				helpers.OptionalNumericListParam(&privacy.TeamIDs, "privacy_team_ids"),
+ 			)
+ 			if err != nil {
+ 				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
+ 			}
++			payload.Type = string(nbType)
+ 
+-			notebookResponse, err := projects.NotebookCreate(ctx, engine, notebookCreateRequest)
++			// Only send privacy when the notebook is explicitly private; otherwise
++			// the API default (visible to everyone on the project) applies. The
++			// privacy object is included only when at least one grantee was given.
++			if private {
++				payload.IsPrivate = &private
++				if len(privacy.UserIDs) > 0 || len(privacy.CompanyIDs) > 0 || len(privacy.TeamIDs) > 0 {
++					payload.Privacy = &privacy
++				}
++			}
++
++			resp, err := twapi.ExecuteRaw(ctx, engine, notebookCreateRequester{
++				projectID: projectID,
++				payload:   payload,
++			})
+ 			if err != nil {
+ 				return helpers.HandleAPIError(err, "failed to create notebook")
+ 			}
+-			return helpers.NewToolResultText("Notebook created successfully with ID %d", notebookResponse.Notebook.ID), nil
++			body, readErr := io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode != http.StatusCreated {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to create notebook"),
++					"failed to create notebook",
++				)
++			}
++			if readErr != nil {
++				return nil, fmt.Errorf("failed to read response body: %w", readErr)
++			}
++
++			var decoded struct {
++				Notebook struct {
++					ID int64 `json:"id"`
++				} `json:"notebook"`
++			}
++			if err := json.Unmarshal(body, &decoded); err != nil {
++				return nil, fmt.Errorf("failed to decode create notebook response: %w", err)
++			}
++			return helpers.NewToolResultText("Notebook created successfully with ID %d", decoded.Notebook.ID), nil
+ 		},
+ 	}
+ }
+ 
++// notebookUpdatePayload is the request body for the v3 update-notebook
++// endpoint. All fields are optional pointers/slices so only the ones the caller
++// supplied are sent (omitempty), leaving every other field unchanged. It exists
++// (instead of the SDK's projects.NotebookUpdateRequest) because that type does
++// not model categoryId — no twapi-go-sdk edit.
++type notebookUpdatePayload struct {
++	Name        *string                `json:"name,omitempty"`
++	Description *string                `json:"description,omitempty"`
++	Contents    *string                `json:"contents,omitempty"`
++	Type        *projects.NotebookType `json:"type,omitempty"`
++	TagIDs      []int64                `json:"tagIds,omitempty"`
++	CategoryID  *int64                 `json:"categoryId,omitempty"`
++}
++
++// notebookUpdateRequester is a local HTTP requester for the v3 update-notebook
++// endpoint, carrying categoryId which the SDK type omits.
++type notebookUpdateRequester struct {
++	notebookID int64
++	payload    notebookUpdatePayload
++}
++
++// HTTPRequest builds the PATCH request for updating a notebook.
++func (r notebookUpdateRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
++	uri := fmt.Sprintf("%s/projects/api/v3/notebooks/%d.json", server, r.notebookID)
++
++	body := struct {
++		Notebook notebookUpdatePayload `json:"notebook"`
++	}{Notebook: r.payload}
++
++	var buf bytes.Buffer
++	if err := json.NewEncoder(&buf).Encode(body); err != nil {
++		return nil, fmt.Errorf("failed to encode update notebook request: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, uri, &buf)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	return req, nil
++}
++
+ // NotebookUpdate updates a notebook in Teamwork.com.
+ func NotebookUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 	return toolsets.ToolWrapper{
+@@ -167,38 +342,59 @@ func NotebookUpdate(engine *twapi.Engine) toolsets.ToolWrapper {
+ 						},
+ 					},
+ 					"tag_ids": helpers.TagIDsAssociateSchema("notebook"),
++					"category_id": {
++						Description: "The ID of the notebook category to file this notebook under. " +
++							"Omit to leave the category unchanged.",
++						AnyOf: []*jsonschema.Schema{
++							{Type: "integer"},
++							{Type: "null"},
++						},
++					},
+ 				},
+ 				Required: []string{"id"},
+ 			},
+ 		},
+ 		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+-			var notebookUpdateRequest projects.NotebookUpdateRequest
+-
+ 			var arguments map[string]any
+ 			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
+ 				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
+ 			}
++
++			var notebookID int64
++			var payload notebookUpdatePayload
+ 			err := helpers.ParamGroup(arguments,
+-				helpers.RequiredNumericParam(&notebookUpdateRequest.Path.ID, "id"),
+-				helpers.OptionalPointerParam(&notebookUpdateRequest.Name, "name"),
+-				helpers.OptionalPointerParam(&notebookUpdateRequest.Description, "description"),
+-				helpers.OptionalPointerParam(&notebookUpdateRequest.Contents, "contents"),
+-				helpers.OptionalPointerParam(&notebookUpdateRequest.Type, "type",
++				helpers.RequiredNumericParam(&notebookID, "id"),
++				helpers.OptionalPointerParam(&payload.Name, "name"),
++				helpers.OptionalPointerParam(&payload.Description, "description"),
++				helpers.OptionalPointerParam(&payload.Contents, "contents"),
++				helpers.OptionalPointerParam(&payload.Type, "type",
+ 					helpers.RestrictValues(
+ 						projects.NotebookTypeMarkdown,
+ 						projects.NotebookTypeHTML,
+ 					),
+ 				),
+-				helpers.OptionalNumericListParam(&notebookUpdateRequest.TagIDs, "tag_ids"),
++				helpers.OptionalNumericListParam(&payload.TagIDs, "tag_ids"),
++				helpers.OptionalNumericPointerParam(&payload.CategoryID, "category_id"),
+ 			)
+ 			if err != nil {
+ 				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
+ 			}
+ 
+-			_, err = projects.NotebookUpdate(ctx, engine, notebookUpdateRequest)
++			resp, err := twapi.ExecuteRaw(ctx, engine, notebookUpdateRequester{
++				notebookID: notebookID,
++				payload:    payload,
++			})
+ 			if err != nil {
+ 				return helpers.HandleAPIError(err, "failed to update notebook")
+ 			}
++			_, _ = io.ReadAll(resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode != http.StatusOK {
++				return helpers.HandleAPIError(
++					twapi.NewHTTPError(resp, "failed to update notebook"),
++					"failed to update notebook",
++				)
++			}
+ 			return helpers.NewToolResultText("Notebook updated successfully"), nil
+ 		},
+ 	}
 diff --git a/internal/twprojects/notifications.go b/internal/twprojects/notifications.go
 new file mode 100644
 index 0000000..83b1834
@@ -1227,10 +3817,10 @@ index 0000000..83b1834
 +	return out
 +}
 diff --git a/internal/twprojects/tasks.go b/internal/twprojects/tasks.go
-index b13830a..e3efdb8 100644
+index 8c99fd4..80ab304 100644
 --- a/internal/twprojects/tasks.go
 +++ b/internal/twprojects/tasks.go
-@@ -615,7 +615,8 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+@@ -652,7 +652,8 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
  		Tool: &mcp.Tool{
  			Name: string(MethodTaskList),
  			Description: "List tasks with structured filters (tasklist_id, project_id, or site-wide). " +
@@ -1240,7 +3830,7 @@ index b13830a..e3efdb8 100644
  			Annotations: &mcp.ToolAnnotations{
  				Title:        "List Tasks",
  				ReadOnlyHint: true,
-@@ -702,6 +703,29 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+@@ -739,6 +740,29 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
  							{Type: "null"},
  						},
  					},
@@ -1270,7 +3860,7 @@ index b13830a..e3efdb8 100644
  					"page":      helpers.PageSchema(),
  					"page_size": helpers.PageSizeSchema(),
  					"verbose":   helpers.VerboseSchema(),
-@@ -734,6 +758,9 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
+@@ -771,6 +795,9 @@ func TaskList(engine *twapi.Engine) toolsets.ToolWrapper {
  				helpers.OptionalTimePointerParam(&taskListRequest.Filters.UpdatedBefore, "updated_before"),
  				helpers.OptionalTimePointerParam(&taskListRequest.Filters.CompletedAfter, "completed_after"),
  				helpers.OptionalTimePointerParam(&taskListRequest.Filters.CompletedBefore, "completed_before"),
@@ -1281,10 +3871,10 @@ index b13830a..e3efdb8 100644
  			)
  			if err != nil {
 diff --git a/internal/twprojects/tools.go b/internal/twprojects/tools.go
-index 39dbce4..a08a227 100644
+index 1ce0c48..bc400a3 100644
 --- a/internal/twprojects/tools.go
 +++ b/internal/twprojects/tools.go
-@@ -99,6 +99,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+@@ -100,6 +100,7 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
  	tasksWriteTools := []toolsets.ToolWrapper{
  		TaskComplete(engine),
  		TaskCreate(engine),
@@ -1292,229 +3882,38 @@ index 39dbce4..a08a227 100644
  		TasklistCreate(engine),
  		TasklistUpdate(engine),
  		TaskUpdate(engine),
-@@ -236,6 +237,9 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+@@ -219,10 +220,15 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+ 		TagUpdate(engine),
+ 		MessageCreate(engine),
+ 		MessageUpdate(engine),
++		SetMessageCategory(engine),
+ 		MessageReplyCreate(engine),
+ 		MessageReplyUpdate(engine),
+ 		LinkCreate(engine),
+ 		LinkUpdate(engine),
++		UpdateFile(engine),
++		UploadToCloudStorage(engine),
++		LinkCloudFile(engine),
++		InlineImageUpload(engine),
+ 	}
+ 	if allowDelete {
+ 		contentWriteTools = append(contentWriteTools,
+@@ -233,12 +239,18 @@ func DefaultToolsetGroup(readOnly, allowDelete bool, engine *twapi.Engine) *tool
+ 			MessageDelete(engine),
+ 			MessageReplyDelete(engine),
+ 			LinkDelete(engine),
++			DeleteFile(engine),
+ 		)
+ 	}
+ 	contentToolset := toolsets.NewToolset(ToolsetContent, contentDescription).
  		AddWriteTools(contentWriteTools...).
  		AddReadTools(
  			ActivityList(engine),
 +			MyNotifications(engine),
++			ListMessageCategories(engine),
 +			ListTaskFiles(engine),
 +			DownloadFile(engine),
++			BrowseCloudStorage(engine),
  			CommentGet(engine),
  			CommentList(engine),
  			MilestoneGet(engine),
-diff --git a/internal/twprojects/notebooks.go b/internal/twprojects/notebooks.go
-index 502bc6c..d169455 100644
---- a/internal/twprojects/notebooks.go
-+++ b/internal/twprojects/notebooks.go
-@@ -1,6 +1,7 @@
- package twprojects
- 
- import (
-+	"bytes"
- 	"context"
- 	"encoding/json"
- 	"fmt"
-@@ -48,6 +49,57 @@ func init() {
- 	helpers.WithMetaWebLinkSchema(notebookListOutputSchema)
- }
- 
-+// notebookPrivacy is the v3 privacy object: the users, companies, and teams
-+// granted access when a notebook is private. The SDK's NotebookCreateRequest
-+// does not model privacy, so it is built here and sent via ExecuteRaw.
-+type notebookPrivacy struct {
-+	UserIDs    []int64 `json:"userIds,omitempty"`
-+	CompanyIDs []int64 `json:"companyIds,omitempty"`
-+	TeamIDs    []int64 `json:"teamIds,omitempty"`
-+}
-+
-+// notebookCreatePayload is the request body for the v3 create-notebook
-+// endpoint, including the isPrivate/privacy fields the SDK type omits.
-+type notebookCreatePayload struct {
-+	Name        string           `json:"name"`
-+	Description *string          `json:"description,omitempty"`
-+	Contents    string           `json:"contents"`
-+	Type        string           `json:"type"`
-+	TagIDs      []int64          `json:"tagIds,omitempty"`
-+	IsPrivate   *bool            `json:"isPrivate,omitempty"`
-+	Privacy     *notebookPrivacy `json:"privacy,omitempty"`
-+}
-+
-+// notebookCreateRequester is a local HTTP requester for the v3 create-notebook
-+// endpoint. It exists (instead of the SDK's projects.NotebookCreate) so the
-+// request body can carry isPrivate/privacy, which the SDK type does not model —
-+// no twapi-go-sdk edit.
-+type notebookCreateRequester struct {
-+	projectID int64
-+	payload   notebookCreatePayload
-+}
-+
-+// HTTPRequest builds the POST request for creating a notebook.
-+func (r notebookCreateRequester) HTTPRequest(ctx context.Context, server string) (*http.Request, error) {
-+	uri := fmt.Sprintf("%s/projects/api/v3/projects/%d/notebooks.json", server, r.projectID)
-+
-+	body := struct {
-+		Notebook notebookCreatePayload `json:"notebook"`
-+	}{Notebook: r.payload}
-+
-+	var buf bytes.Buffer
-+	if err := json.NewEncoder(&buf).Encode(body); err != nil {
-+		return nil, fmt.Errorf("failed to encode create notebook request: %w", err)
-+	}
-+
-+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, &buf)
-+	if err != nil {
-+		return nil, err
-+	}
-+	req.Header.Set("Content-Type", "application/json")
-+	return req, nil
-+}
-+
- // NotebookCreate creates a notebook in Teamwork.com.
- func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
- 	return toolsets.ToolWrapper{
-@@ -85,39 +137,110 @@ func NotebookCreate(engine *twapi.Engine) toolsets.ToolWrapper {
- 						Enum:        []any{"MARKDOWN", "HTML"},
- 					},
- 					"tag_ids": helpers.TagIDsAssociateSchema("notebook"),
-+					"private": {
-+						Type: "boolean",
-+						Description: "When true, the notebook is private — visible only to the users, companies, " +
-+							"and teams listed in privacy_user_ids/privacy_company_ids/privacy_team_ids (plus site " +
-+							"administrators in the owner company, who always retain access). Defaults to false, " +
-+							"which makes the notebook visible to everyone on the project. If true with no IDs " +
-+							"provided, only the creator and site admins can see it.",
-+					},
-+					"privacy_user_ids": {
-+						Description: "User IDs granted access when private is true.",
-+						AnyOf: []*jsonschema.Schema{
-+							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
-+							{Type: "null"},
-+						},
-+					},
-+					"privacy_company_ids": {
-+						Description: "Company IDs granted access when private is true.",
-+						AnyOf: []*jsonschema.Schema{
-+							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
-+							{Type: "null"},
-+						},
-+					},
-+					"privacy_team_ids": {
-+						Description: "Team IDs granted access when private is true.",
-+						AnyOf: []*jsonschema.Schema{
-+							{Type: "array", Items: &jsonschema.Schema{Type: "integer"}},
-+							{Type: "null"},
-+						},
-+					},
- 				},
- 				Required: []string{"name", "project_id", "contents", "type"},
- 			},
- 		},
- 		Handler: func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
--			var notebookCreateRequest projects.NotebookCreateRequest
--
- 			var arguments map[string]any
- 			if err := json.Unmarshal(request.Params.Arguments, &arguments); err != nil {
- 				return helpers.NewToolResultTextError("failed to decode request: %s", err.Error()), nil
- 			}
-+
-+			var projectID int64
-+			var payload notebookCreatePayload
-+			var nbType projects.NotebookType
-+			var private bool
-+			var privacy notebookPrivacy
- 			err := helpers.ParamGroup(arguments,
--				helpers.RequiredNumericParam(&notebookCreateRequest.Path.ProjectID, "project_id"),
--				helpers.RequiredParam(&notebookCreateRequest.Name, "name"),
--				helpers.OptionalPointerParam(&notebookCreateRequest.Description, "description"),
--				helpers.RequiredParam(&notebookCreateRequest.Contents, "contents"),
--				helpers.RequiredParam(&notebookCreateRequest.Type, "type",
-+				helpers.RequiredNumericParam(&projectID, "project_id"),
-+				helpers.RequiredParam(&payload.Name, "name"),
-+				helpers.OptionalPointerParam(&payload.Description, "description"),
-+				helpers.RequiredParam(&payload.Contents, "contents"),
-+				helpers.RequiredParam(&nbType, "type",
- 					helpers.RestrictValues(
- 						projects.NotebookTypeMarkdown,
- 						projects.NotebookTypeHTML,
- 					),
- 				),
--				helpers.OptionalNumericListParam(&notebookCreateRequest.TagIDs, "tag_ids"),
-+				helpers.OptionalNumericListParam(&payload.TagIDs, "tag_ids"),
-+				helpers.OptionalParam(&private, "private"),
-+				helpers.OptionalNumericListParam(&privacy.UserIDs, "privacy_user_ids"),
-+				helpers.OptionalNumericListParam(&privacy.CompanyIDs, "privacy_company_ids"),
-+				helpers.OptionalNumericListParam(&privacy.TeamIDs, "privacy_team_ids"),
- 			)
- 			if err != nil {
- 				return helpers.NewToolResultTextError("invalid parameters: %s", err.Error()), nil
- 			}
-+			payload.Type = string(nbType)
-+
-+			// Only send privacy when the notebook is explicitly private; otherwise
-+			// the API default (visible to everyone on the project) applies. The
-+			// privacy object is included only when at least one grantee was given.
-+			if private {
-+				payload.IsPrivate = &private
-+				if len(privacy.UserIDs) > 0 || len(privacy.CompanyIDs) > 0 || len(privacy.TeamIDs) > 0 {
-+					payload.Privacy = &privacy
-+				}
-+			}
- 
--			notebookResponse, err := projects.NotebookCreate(ctx, engine, notebookCreateRequest)
-+			resp, err := twapi.ExecuteRaw(ctx, engine, notebookCreateRequester{
-+				projectID: projectID,
-+				payload:   payload,
-+			})
- 			if err != nil {
- 				return helpers.HandleAPIError(err, "failed to create notebook")
- 			}
--			return helpers.NewToolResultText("Notebook created successfully with ID %d", notebookResponse.Notebook.ID), nil
-+			body, readErr := io.ReadAll(resp.Body)
-+			_ = resp.Body.Close()
-+			if resp.StatusCode != http.StatusCreated {
-+				return helpers.HandleAPIError(
-+					twapi.NewHTTPError(resp, "failed to create notebook"),
-+					"failed to create notebook",
-+				)
-+			}
-+			if readErr != nil {
-+				return nil, fmt.Errorf("failed to read response body: %w", readErr)
-+			}
-+
-+			var decoded struct {
-+				Notebook struct {
-+					ID int64 `json:"id"`
-+				} `json:"notebook"`
-+			}
-+			if err := json.Unmarshal(body, &decoded); err != nil {
-+				return nil, fmt.Errorf("failed to decode create notebook response: %w", err)
-+			}
-+			return helpers.NewToolResultText("Notebook created successfully with ID %d", decoded.Notebook.ID), nil
- 		},
- 	}
- }
-diff --git a/internal/twprojects/notebooks_test.go b/internal/twprojects/notebooks_test.go
-index 4375f04..8d6f42c 100644
---- a/internal/twprojects/notebooks_test.go
-+++ b/internal/twprojects/notebooks_test.go
-@@ -20,6 +20,20 @@ func TestNotebookCreate(t *testing.T) {
- 	})
- }
- 
-+func TestNotebookCreatePrivate(t *testing.T) {
-+	mcpServer := mcpServerMock(t, http.StatusCreated, []byte(`{"notebook":{"id":123}}`))
-+	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodNotebookCreate.String(), map[string]any{
-+		"name":                "Private Example",
-+		"project_id":          float64(123),
-+		"contents":            "Confidential content.",
-+		"type":                "HTML",
-+		"private":             true,
-+		"privacy_user_ids":    []float64{10, 11},
-+		"privacy_company_ids": []float64{20},
-+		"privacy_team_ids":    []float64{30},
-+	})
-+}
-+
- func TestNotebookUpdate(t *testing.T) {
- 	mcpServer := mcpServerMock(t, http.StatusOK, []byte(`{}`))
- 	testutil.ExecuteToolRequest(t, mcpServer, twprojects.MethodNotebookUpdate.String(), map[string]any{

@@ -1,9 +1,8 @@
 {
-  "command": "${BIN:python3}",
-  "args": ["${REPO}/servers/teamwork/tw_typefix_proxy.py"],
+  "command": "${OSBIN:${REPO}/servers/teamwork/bin/tw-mcp}",
+  "args": ["-allow-delete"],
   "env": {
     "TW_MCP_BEARER_TOKEN": "${SECRET:TW_MCP_BEARER_TOKEN}",
-    "TW_MCP_API_URL": "${ASK:TW_MCP_API_URL}",
-    "TW_MCP_BIN": "${REPO}/servers/teamwork/bin/tw-mcp"
+    "TW_MCP_API_URL": "${ASK:TW_MCP_API_URL}"
   }
 }

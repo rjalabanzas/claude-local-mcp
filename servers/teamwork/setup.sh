@@ -7,10 +7,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../../lib/common.sh"
 
 # --- pinned versions (must match the trusted reference binary) ---
-MCP_TAG="v1.21.1"
-SDK_TAG="v1.18.1"
-MCP_COMMIT="2f1230dbd42303f6ca6a7668de30f61686b00eeb"           # binary vcs.revision
-SDK_HASH="h1:o5nGwwlq1UvcXM+VAmYSPqhXd886I1jh55T9fvtmjjw="        # binary's recorded SDK module hash
+MCP_TAG="v1.23.0"
+SDK_TAG="v1.19.4"
+MCP_COMMIT="cc84e5048f095a238ddcdca6f80bbb12314ccd5d"           # binary vcs.revision (v1.23.0^{commit})
+SDK_HASH="h1:s7+gzMWrwprOxamv/I/mJug02sdPioSq7RWUM6QLoKk="        # binary's recorded SDK module hash
 
 GO="$(resolve_bin go)"
 BUILD="$HERE/.build"; rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
@@ -34,7 +34,7 @@ sum="$(printf '%s' "$info" | "$PY" -c 'import json,sys;print(json.load(sys.stdin
 ok "SDK module hash matches reference binary"
 
 # --- apply our patches ---
-log "applying due-date/overdue patches"
+log "applying Plan Africa patches (typefix, cloud-storage, file ops, message categories, notifications, due-date filters)"
 git -C mcp apply "$HERE/mcp.patch"
 git -C sdk apply "$HERE/sdk.patch"
 

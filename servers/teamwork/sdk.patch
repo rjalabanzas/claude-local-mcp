@@ -1,5 +1,5 @@
 diff --git a/projects/task.go b/projects/task.go
-index 43b1520..ed1bf80 100644
+index 21ec6f8..9df02ce 100644
 --- a/projects/task.go
 +++ b/projects/task.go
 @@ -778,6 +778,20 @@ type TaskListRequestFilters struct {
