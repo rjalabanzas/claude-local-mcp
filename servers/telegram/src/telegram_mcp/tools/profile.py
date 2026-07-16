@@ -400,6 +400,56 @@ async def get_user_photos(user_id: Union[int, str], limit: int = 10, account: st
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(
+        title="Download Profile Photo", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("user_id")
+async def download_profile_photo(
+    user_id: Union[int, str],
+    file_path: Optional[str] = None,
+    ctx: Optional[Context] = None,
+    account: str = None,
+) -> str:
+    """
+    Download a user's current profile photo (avatar) to a file.
+    Args:
+        user_id: The user ID or username.
+        file_path: Optional absolute or relative path under allowed roots.
+            If omitted, saves into `<first_root>/downloads/`.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(user_id, cl)
+
+        default_name = f"telegram_avatar_{user_id}_{int(time.time())}"
+        out_path, path_error = await _resolve_writable_file_path(
+            raw_path=file_path,
+            default_filename=default_name,
+            ctx=ctx,
+            tool_name="download_profile_photo",
+        )
+        if path_error:
+            return path_error
+
+        downloaded = await cl.download_profile_photo(entity, file=str(out_path))
+        if not downloaded:
+            return f"No profile photo set for user {user_id}."
+
+        final_path = Path(downloaded).resolve(strict=True)
+        roots, roots_error = await _ensure_allowed_roots(ctx, "download_profile_photo")
+        if roots_error:
+            return roots_error
+        if not _path_is_within_any_root(final_path, roots):
+            return "Download failed: resulting path is outside allowed roots."
+
+        return f"Profile photo downloaded to {final_path}."
+    except Exception as e:
+        return log_and_format_error("download_profile_photo", e, user_id=user_id)
+
+
+@mcp.tool(
     annotations=ToolAnnotations(title="Get User Status", openWorldHint=True, readOnlyHint=True)
 )
 @with_account(readonly=True)
@@ -425,6 +475,7 @@ __all__ = [
     "set_privacy_settings",
     "get_full_user",
     "get_user_photos",
+    "download_profile_photo",
     "get_user_status",
     "get_bot_info",
     "set_bot_commands",

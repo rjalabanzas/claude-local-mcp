@@ -811,6 +811,65 @@ def get_engagement_info(message) -> str:
     return f" | {', '.join(engagement_parts)}" if engagement_parts else ""
 
 
+def get_media_indicator(message) -> Optional[str]:
+    """Return a short human-readable label for a message's attached media, or None.
+
+    History readers surface only ``msg.message`` (the text or caption), so a
+    media message with no caption appeared as a blank row and a captioned one
+    gave no signal an attachment existed. This inspects Telethon's convenience
+    media properties and returns a compact tag ("photo", "video", "voice",
+    "document: report.pdf", …) so callers know media is present and can act on
+    the message id (e.g. download_media / get_media_info).
+
+    Web-page link previews are treated as plain text (the URL is already in the
+    body) and return None. The whole thing is wrapped defensively so a media
+    shape the installed Telethon version doesn't expose can never break a read.
+    """
+    try:
+        media = getattr(message, "media", None)
+        if not media:
+            return None
+        # A link unfurl is not an attachment — the URL is in the text already.
+        if type(media).__name__ == "MessageMediaWebPage":
+            return None
+        # Order matters: voice/video-note/gif are documents with extra flags,
+        # so check the more specific properties before the generic ones.
+        if getattr(message, "photo", None):
+            return "photo"
+        if getattr(message, "voice", None):
+            return "voice"
+        if getattr(message, "video_note", None):
+            return "video note"
+        if getattr(message, "gif", None):
+            return "gif"
+        if getattr(message, "video", None):
+            return "video"
+        if getattr(message, "audio", None):
+            return "audio"
+        if getattr(message, "sticker", None):
+            return "sticker"
+        if getattr(message, "document", None):
+            f = getattr(message, "file", None)
+            name = getattr(f, "name", None) if f else None
+            if name:
+                return f"document: {sanitize_name(name)}"
+            mime = getattr(f, "mime_type", None) if f else None
+            return f"document ({mime})" if mime else "document"
+        if getattr(message, "contact", None):
+            return "contact"
+        if getattr(message, "geo", None):
+            return "location"
+        if getattr(message, "poll", None):
+            return "poll"
+        # Fallback: strip the MessageMedia prefix off the raw type name.
+        media_type = type(media).__name__
+        if media_type.startswith("MessageMedia"):
+            media_type = media_type[len("MessageMedia") :]
+        return media_type.lower() or "media"
+    except Exception:
+        return "media"
+
+
 def get_engagement_dict(message) -> Optional[Dict[str, Any]]:
     """Return engagement metrics as a dict for JSON-formatted tool results."""
     result = {}

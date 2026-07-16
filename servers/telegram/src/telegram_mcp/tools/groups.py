@@ -243,12 +243,13 @@ async def get_participants(
         cl = get_client(account)
         await ensure_connected(cl)
 
-        # Use iter_participants with offset to fetch only the needed slice,
-        # avoiding O(N) fetching on later pages.
+        # Telethon's iter/get_participants has no offset parameter, so fetch
+        # up to the end of the requested page and slice locally. Later pages
+        # re-fetch earlier ones (O(page * page_size)), which is acceptable here.
         offset = (page - 1) * page_size
-        participants = []
-        async for participant in cl.iter_participants(chat_id, limit=page_size, offset=offset):
-            participants.append(participant)
+        fetched = await cl.get_participants(chat_id, limit=offset + page_size)
+        participants = list(fetched)[offset : offset + page_size]
+        has_more = len(fetched) == offset + page_size
 
         if not participants:
             return format_tool_result([])
@@ -265,7 +266,6 @@ async def get_participants(
         result = format_tool_result(records)
 
         # Append pagination metadata; has_more indicates whether a next page likely exists
-        has_more = len(participants) == page_size
         result += f"\n\nPage {page} (showing {len(participants)} participants)"
         if has_more:
             result += f" — more results available on page {page + 1}"

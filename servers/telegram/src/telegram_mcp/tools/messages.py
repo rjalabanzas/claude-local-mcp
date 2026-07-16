@@ -66,10 +66,12 @@ async def get_messages(
                     reply_info += f' (quoting: "{quoted}")'
 
             engagement_info = get_engagement_info(msg)
+            media = get_media_indicator(msg)
+            media_info = f" | Media: {media}" if media else ""
             safe_text = sanitize_user_content(msg.message).replace("\n", "\\n")
 
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info} | Message: {safe_text}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info}{media_info} | Message: {safe_text}"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -625,6 +627,9 @@ async def list_messages(
             engagement = get_engagement_dict(msg)
             if engagement:
                 record["engagement"] = engagement
+            media = get_media_indicator(msg)
+            if media:
+                record["media"] = media
             records.append(record)
 
         return format_tool_result(records)
@@ -687,6 +692,9 @@ async def get_message_context(
                 "is_target": msg.id == message_id,
                 "text": sanitize_user_content(msg.message),
             }
+            media = get_media_indicator(msg)
+            if media:
+                record["media"] = media
 
             # Check if this message is a reply and get the replied message
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
@@ -1151,6 +1159,9 @@ async def get_history(chat_id: Union[int, str], limit: int = 100, account: str =
                 "date": msg.date,
                 "text": sanitize_user_content(msg.message),
             }
+            media = get_media_indicator(msg)
+            if media:
+                record["media"] = media
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 record["reply_to"] = msg.reply_to.reply_to_msg_id
             records.append(record)
@@ -1196,6 +1207,9 @@ async def get_pinned_messages(chat_id: Union[int, str], account: str = None) -> 
                 "date": msg.date,
                 "text": sanitize_user_content(msg.message),
             }
+            media = get_media_indicator(msg)
+            if media:
+                record["media"] = media
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 record["reply_to"] = msg.reply_to.reply_to_msg_id
             records.append(record)
