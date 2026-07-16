@@ -1,0 +1,11 @@
+{
+  "command": "${BIN:node}",
+  "args": ["${REPO}/servers/semper/src/server.js"],
+  "env": {
+    "SEMPER_BASE_URL": "https://iis-prod.semper-services.com/IntegrationsAPI/",
+    "SEMPER_VENUE_ID": "${ASK:SEMPER_VENUE_ID}",
+    "SEMPER_X_CHANNEL": "${SECRET:SEMPER_X_CHANNEL}",
+    "SEMPER_X_API_KEY": "${SECRET:SEMPER_X_API_KEY}",
+    "SEMPER_X_TOKEN": "${SECRET:SEMPER_X_TOKEN}"
+  }
+}

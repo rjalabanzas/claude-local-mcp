@@ -51,7 +51,9 @@ run the `.sh` scripts.
 
 | Server | What | Built how | Per-machine auth |
 |---|---|---|---|
-| `teamwork` | Projects/Desk/Spaces (`tw-mcp`, patched for due-date/overdue) | from **official** upstream + our patch, provenance-verified | paste bearer token |
+| `teamwork` | Projects/Spaces/Chat/Calendar (`tw-mcp` v1.23.0, patched: cloud-storage, file ops, message categories, notifications, due-date filters) | from **official** upstream + our patch, provenance-verified | paste bearer token |
+| `teamwork-desk` | Teamwork Desk — tickets/customers/admin (same `tw-mcp` binary, `twdesk` toolsets) | shares the `teamwork` binary | paste Desk API key |
+| `semper` | Semper PMS (IntegrationsAPI) — read-only reservations/arrivals/in-house/availability/day-ends | vendored (own code) | venue ID + 3 IntegrationsAPI headers |
 | `ms365` | Outlook/Calendar/SharePoint/Teams/etc. (one entry **per account**) | config only (`npx`) | `./servers/ms365/login.sh <prefix>` (device-code; per-account file) |
 | `google` | Gmail/Calendar/Drive/Docs/Sheets/Contacts/Tasks (gogcli; one entry **per account**) | downloads `gog` binary | `./servers/google/login.sh <prefix> <credentials.json>` (OAuth; per-account file) |
 | `readai` | Read.ai meetings/transcripts | vendored (own code) | `uv run servers/readai/auth.py` |

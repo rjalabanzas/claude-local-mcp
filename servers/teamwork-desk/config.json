@@ -1,0 +1,8 @@
+{
+  "command": "${OSBIN:${REPO}/servers/teamwork/bin/tw-mcp}",
+  "args": ["-toolsets=twdesk-tickets,twdesk-customers,twdesk-admin"],
+  "env": {
+    "TW_MCP_BEARER_TOKEN": "${SECRET:TW_DESK_API_KEY}",
+    "TW_MCP_API_URL": "${ASK:TW_MCP_API_URL}"
+  }
+}

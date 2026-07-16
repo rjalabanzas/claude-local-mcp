@@ -1,0 +1,11 @@
+{
+  "name": "pa-semper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for a Semper PMS (IntegrationsAPI). Read-only.",
+  "author": "Plan Africa",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
